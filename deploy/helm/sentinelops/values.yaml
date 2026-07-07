@@ -1,0 +1,25 @@
+namespace: sentinelops
+
+api:
+  image: sentinelops/api:latest
+  replicas: 1
+  port: 8080
+
+web:
+  image: sentinelops/web:latest
+  replicas: 1
+  port: 3000
+
+postgres:
+  image: postgres:16-alpine
+  database: sentinelops
+  username: sentinelops
+  password: sentinelops
+
+redis:
+  image: redis:7-alpine
+
+auth:
+  enabled: false
+  issuerUrl: http://keycloak.sentinelops.svc.cluster.local:8080/realms/sentinelops
+  clientId: sentinelops-web

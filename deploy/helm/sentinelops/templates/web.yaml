@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinelops-web
+  namespace: {{ .Values.namespace }}
+spec:
+  replicas: {{ .Values.web.replicas }}
+  selector:
+    matchLabels:
+      app: sentinelops-web
+  template:
+    metadata:
+      labels:
+        app: sentinelops-web
+    spec:
+      containers:
+        - name: web
+          image: {{ .Values.web.image }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: {{ .Values.web.port }}
+          envFrom:
+            - configMapRef:
+                name: sentinelops-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinelops-web
+  namespace: {{ .Values.namespace }}
+spec:
+  selector:
+    app: sentinelops-web
+  ports:
+    - port: {{ .Values.web.port }}
+      targetPort: {{ .Values.web.port }}

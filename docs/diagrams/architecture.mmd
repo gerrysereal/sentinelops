@@ -1,0 +1,18 @@
+flowchart LR
+  Dev[Developer] --> Git[GitHub]
+  Git --> CI[GitHub Actions]
+  CI --> Scan[Trivy/Semgrep/Gitleaks/Sonar/Syft]
+  CI --> Harbor[Harbor Registry]
+  Harbor --> Argo[Argo CD]
+  Argo --> K8s[Kubernetes k3s]
+  K8s --> Obs[Prometheus/Loki/Tempo/Alloy]
+  K8s --> Sec[Falco/Wazuh/OPA]
+  Obs --> API[SentinelOps API]
+  Sec --> API
+  Argo --> API
+  Harbor --> API
+  API --> DB[(PostgreSQL)]
+  API --> Cache[(Redis)]
+  Web[Next.js Web UI] --> API
+  Keycloak[Keycloak] --> Web
+  Keycloak --> API

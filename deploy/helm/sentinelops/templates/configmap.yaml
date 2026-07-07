@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinelops-config
+  namespace: {{ .Values.namespace }}
+data:
+  APP_ENV: production
+  API_PORT: "{{ .Values.api.port }}"
+  REDIS_ADDR: sentinelops-redis:6379
+  AUTH_ENABLED: "{{ .Values.auth.enabled }}"
+  KEYCLOAK_ISSUER_URL: "{{ .Values.auth.issuerUrl }}"
+  KEYCLOAK_CLIENT_ID: "{{ .Values.auth.clientId }}"
+  NEXT_PUBLIC_API_BASE_URL: http://sentinelops-api:{{ .Values.api.port }}/api/v1

@@ -1,0 +1,3023 @@
+diff --git a/.env.example b/.env.example
+index a3fe5fb..398ce1f 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,15 +1,20 @@
+ POSTGRES_DB=sentinelops
+ POSTGRES_USER=sentinelops
+-POSTGRES_PASSWORD=sentinelops
+-DATABASE_URL=postgres://sentinelops:sentinelops@postgres:5432/sentinelops?sslmode=disable
++POSTGRES_PASSWORD=change-me-local-only
++DATABASE_URL=postgres://sentinelops:change-me-local-only@postgres:5432/sentinelops?sslmode=disable
+ REDIS_ADDR=redis:6379
+ REDIS_PASSWORD=
+ API_PORT=8080
+ APP_ENV=local
+ AUTH_ENABLED=false
+-KEYCLOAK_ISSUER_URL=http://keycloak:8080/realms/sentinelops
++SENTINELOPS_BOOTSTRAP_TOKEN=
++KEYCLOAK_ISSUER_URL=
+ KEYCLOAK_CLIENT_ID=sentinelops-web
++CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+ NEXT_PUBLIC_API_BASE_URL=http://localhost:8080/api/v1
+-
+ PLATFORM_MODE=demo
+-INTEGRATION_ENCRYPTION_KEY=sentinelops-local-dev-key-change-me
++INTEGRATION_ENCRYPTION_KEY=change-me-to-a-long-random-secret
++REQUEST_TIMEOUT=15s
++INTEGRATION_TIMEOUT=8s
++INTEGRATION_RETRIES=2
++LOG_FORMAT=text
+diff --git a/README.md b/README.md
+index 9f75bf8..afa18bf 100644
+--- a/README.md
++++ b/README.md
+@@ -141,7 +141,7 @@ PLATFORM_MODE=demo docker-compose up --build
+ Switching modes:
+ 
+ ```env
+-PLATFORM_MODE=demo        # simulator adapters
++PLATFORM_MODE=demo        # real health-check adapters
+ PLATFORM_MODE=lab         # HTTP adapters for Docker Compose/lab services
+ PLATFORM_MODE=production  # HTTP adapters for real endpoints
+ ```
+diff --git a/apps/api/cmd/api/main.go b/apps/api/cmd/api/main.go
+index 640aea9..a4ddcdb 100644
+--- a/apps/api/cmd/api/main.go
++++ b/apps/api/cmd/api/main.go
+@@ -2,8 +2,12 @@ package main
+ 
+ import (
+ 	"context"
+-	"log"
++	"errors"
++	"log/slog"
+ 	"net/http"
++	"os"
++	"os/signal"
++	"syscall"
+ 	"time"
+ 
+ 	"github.com/sentinelops/sentinelops/apps/api/internal/application"
+@@ -14,25 +18,36 @@ import (
+ 	"github.com/sentinelops/sentinelops/apps/api/internal/platform/database"
+ 	httpplatform "github.com/sentinelops/sentinelops/apps/api/internal/platform/http"
+ 	"github.com/sentinelops/sentinelops/apps/api/internal/platform/integrations"
++	"github.com/sentinelops/sentinelops/apps/api/internal/platform/logging"
+ )
+ 
+ func main() {
+ 	cfg := config.Load()
++	logger := logging.New(cfg.LogFormat, os.Stdout)
++	slog.SetDefault(logger)
++	if err := cfg.Validate(); err != nil {
++		logger.Error("invalid runtime configuration", "error", err)
++		os.Exit(1)
++	}
++
+ 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+ 	defer cancel()
+ 
+ 	pool, err := database.Connect(ctx, cfg.DatabaseURL)
+ 	if err != nil {
+-		log.Fatalf("connect postgres: %v", err)
++		logger.Error("connect postgres failed", "error", err)
++		os.Exit(1)
+ 	}
+ 	defer pool.Close()
+ 
+ 	if err := database.Migrate(ctx, pool); err != nil {
+-		log.Fatalf("migrate postgres: %v", err)
++		logger.Error("migrate postgres failed", "error", err)
++		os.Exit(1)
+ 	}
+ 
+-	if err := database.Seed(ctx, pool); err != nil {
+-		log.Fatalf("seed postgres: %v", err)
++	if err := database.Seed(ctx, pool, cfg.PlatformMode); err != nil {
++		logger.Error("seed postgres failed", "error", err)
++		os.Exit(1)
+ 	}
+ 
+ 	redisClient := cache.NewRedisClient(cfg.RedisAddr, cfg.RedisPassword)
+@@ -44,22 +59,45 @@ func main() {
+ 
+ 	secretBox, err := secretcrypto.NewSecretBox(cfg.EncryptionKey)
+ 	if err != nil {
+-		log.Fatalf("initialize secret box: %v", err)
++		logger.Error("initialize secret box failed", "error", err)
++		os.Exit(1)
+ 	}
+-	integrationRegistry := integrations.NewRegistry(cfg.PlatformMode)
++	integrationRegistry := integrations.NewRegistry(integrations.RegistryOptions{
++		Mode:    cfg.PlatformMode,
++		Timeout: cfg.IntegrationTimeout,
++		Retries: cfg.IntegrationRetries,
++	})
+ 	integrationService := application.NewIntegrationService(repository, secretBox, integrationRegistry, cfg.PlatformMode)
+ 
+ 	authMiddleware := auth.NewMiddleware(cfg)
+-	router := httpplatform.NewRouter(cfg, overviewService, moduleService, integrationService, authMiddleware)
++	router := httpplatform.NewRouter(cfg, overviewService, moduleService, integrationService, authMiddleware, redisClient, logger)
+ 
+ 	server := &http.Server{
+ 		Addr:              ":" + cfg.APIPort,
+ 		Handler:           router,
+ 		ReadHeaderTimeout: 10 * time.Second,
++		ReadTimeout:       cfg.RequestTimeout,
++		WriteTimeout:      cfg.RequestTimeout,
++		IdleTimeout:       60 * time.Second,
+ 	}
+ 
+-	log.Printf("SentinelOps API listening on :%s", cfg.APIPort)
+-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+-		log.Fatalf("api server failed: %v", err)
++	go func() {
++		logger.Info("SentinelOps API listening", "port", cfg.APIPort, "app_env", cfg.AppEnv, "platform_mode", cfg.PlatformMode)
++		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
++			logger.Error("api server failed", "error", err)
++			os.Exit(1)
++		}
++	}()
++
++	shutdown := make(chan os.Signal, 1)
++	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
++	<-shutdown
++
++	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
++	defer shutdownCancel()
++	if err := server.Shutdown(shutdownCtx); err != nil {
++		logger.Error("api graceful shutdown failed", "error", err)
++		os.Exit(1)
+ 	}
++	logger.Info("SentinelOps API stopped")
+ }
+diff --git a/apps/api/internal/application/integration_service.go b/apps/api/internal/application/integration_service.go
+index 6eea484..5460981 100644
+--- a/apps/api/internal/application/integration_service.go
++++ b/apps/api/internal/application/integration_service.go
+@@ -3,6 +3,7 @@ package application
+ import (
+ 	"context"
+ 	"fmt"
++	"net/url"
+ 	"strings"
+ 
+ 	"github.com/sentinelops/sentinelops/apps/api/internal/domain"
+@@ -38,6 +39,9 @@ func (s *IntegrationService) Get(ctx context.Context, id string) (domain.Integra
+ }
+ 
+ func (s *IntegrationService) Create(ctx context.Context, req domain.CreateIntegrationRequest) (domain.IntegrationConfig, error) {
++	if err := validateIntegrationInput(req.Type, req.EndpointURL, req.SyncIntervalSeconds); err != nil {
++		return domain.IntegrationConfig{}, err
++	}
+ 	cfg := domain.IntegrationConfig{
+ 		Name:                strings.TrimSpace(req.Name),
+ 		Type:                strings.TrimSpace(req.Type),
+@@ -87,6 +91,9 @@ func (s *IntegrationService) Update(ctx context.Context, id string, req domain.U
+ 		cfg.Category = categoryFor(cfg.Type, *req.Category)
+ 	}
+ 	if req.EndpointURL != nil {
++		if err := validateEndpointURL(*req.EndpointURL); err != nil {
++			return domain.IntegrationConfig{}, err
++		}
+ 		cfg.EndpointURL = strings.TrimSpace(*req.EndpointURL)
+ 	}
+ 	if req.Username != nil {
+@@ -99,6 +106,9 @@ func (s *IntegrationService) Update(ctx context.Context, id string, req domain.U
+ 		cfg.TLSVerify = *req.TLSVerify
+ 	}
+ 	if req.SyncIntervalSeconds != nil {
++		if *req.SyncIntervalSeconds < 15 || *req.SyncIntervalSeconds > 86400 {
++			return domain.IntegrationConfig{}, fmt.Errorf("sync interval must be between 15 and 86400 seconds")
++		}
+ 		cfg.SyncIntervalSeconds = *req.SyncIntervalSeconds
+ 	}
+ 	if req.Enabled != nil {
+@@ -166,6 +176,37 @@ func (s *IntegrationService) Logs(ctx context.Context, id string) ([]domain.Inte
+ 	return s.repo.ListIntegrationLogs(ctx, id)
+ }
+ 
++func (s *IntegrationService) Status(ctx context.Context, id string) (domain.IntegrationStatusView, error) {
++	return s.repo.GetIntegrationStatus(ctx, id)
++}
++
++func (s *IntegrationService) ConnectionHistory(ctx context.Context, id string) ([]domain.ConnectionHistory, error) {
++	return s.repo.ListConnectionHistory(ctx, id)
++}
++
++func (s *IntegrationService) Types(ctx context.Context) []domain.IntegrationType {
++	return []domain.IntegrationType{
++		{Type: "Prometheus", Category: "Observability", Description: "Metrics provider health and query integration"},
++		{Type: "Grafana", Category: "Observability", Description: "Dashboard and visualization integration"},
++		{Type: "Harbor", Category: "Registry", Description: "Container registry integration"},
++		{Type: "Vault", Category: "Secrets", Description: "Vault/OpenBao secret management integration"},
++		{Type: "GitHub", Category: "SCM", Description: "Repository provider integration"},
++		{Type: "GitHubActions", Category: "CI/CD", Description: "Pipeline provider integration"},
++		{Type: "ArgoCD", Category: "GitOps", Description: "GitOps deployment integration"},
++		{Type: "Kubernetes", Category: "Runtime", Description: "Cluster inventory and workload integration"},
++		{Type: "Loki", Category: "Observability", Description: "Log query integration"},
++		{Type: "Tempo", Category: "Observability", Description: "Trace query integration"},
++		{Type: "SonarQube", Category: "Security", Description: "Code quality and SAST integration"},
++		{Type: "Trivy", Category: "Security", Description: "Vulnerability scanner integration"},
++		{Type: "Semgrep", Category: "Security", Description: "Static analysis scanner integration"},
++		{Type: "Gitleaks", Category: "Security", Description: "Secret scanning integration"},
++		{Type: "Falco", Category: "Runtime Security", Description: "Runtime detection integration"},
++		{Type: "Wazuh", Category: "SIEM", Description: "SIEM and compliance integration"},
++		{Type: "Keycloak", Category: "Authentication", Description: "Identity provider integration"},
++		{Type: "OPA-Gatekeeper", Category: "Policy", Description: "Kubernetes policy enforcement integration"},
++	}
++}
++
+ func (s *IntegrationService) decrypt(cfg domain.IntegrationConfig) (domain.IntegrationConfig, error) {
+ 	var err error
+ 	cfg.AccessToken, err = s.secretBox.Decrypt(cfg.AccessToken)
+@@ -179,6 +220,30 @@ func (s *IntegrationService) decrypt(cfg domain.IntegrationConfig) (domain.Integ
+ 	return cfg, nil
+ }
+ 
++func validateIntegrationInput(toolType string, endpointURL string, syncInterval int) error {
++	if strings.TrimSpace(toolType) == "" {
++		return fmt.Errorf("integration type is required")
++	}
++	if err := validateEndpointURL(endpointURL); err != nil {
++		return err
++	}
++	if syncInterval != 0 && (syncInterval < 15 || syncInterval > 86400) {
++		return fmt.Errorf("sync interval must be between 15 and 86400 seconds")
++	}
++	return nil
++}
++
++func validateEndpointURL(endpoint string) error {
++	parsed, err := url.Parse(strings.TrimSpace(endpoint))
++	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
++		return fmt.Errorf("endpoint URL must be a valid absolute URL")
++	}
++	if parsed.Scheme != "http" && parsed.Scheme != "https" {
++		return fmt.Errorf("endpoint URL scheme must be http or https")
++	}
++	return nil
++}
++
+ func categoryFor(toolType string, fallback string) string {
+ 	fallback = strings.TrimSpace(fallback)
+ 	if fallback != "" {
+diff --git a/apps/api/internal/application/module_service.go b/apps/api/internal/application/module_service.go
+index ec4fdf7..55b07ae 100644
+--- a/apps/api/internal/application/module_service.go
++++ b/apps/api/internal/application/module_service.go
+@@ -2,6 +2,7 @@ package application
+ 
+ import (
+ 	"context"
++	"fmt"
+ 
+ 	"github.com/sentinelops/sentinelops/apps/api/internal/domain"
+ 	"github.com/sentinelops/sentinelops/apps/api/internal/platform/database"
+@@ -28,7 +29,7 @@ func (s *ModuleService) ListPipelines(ctx context.Context) ([]domain.PipelineRun
+ }
+ 
+ func (s *ModuleService) RunPipeline(ctx context.Context, req domain.CreatePipelineRunRequest) (domain.PipelineRun, error) {
+-	return s.repo.CreatePipelineRun(ctx, req)
++	return domain.PipelineRun{}, fmt.Errorf("pipeline execution is disabled until a real GitHubActions adapter is connected")
+ }
+ 
+ func (s *ModuleService) ListDeployments(ctx context.Context) ([]domain.Deployment, error) {
+@@ -36,7 +37,7 @@ func (s *ModuleService) ListDeployments(ctx context.Context) ([]domain.Deploymen
+ }
+ 
+ func (s *ModuleService) CreateDeployment(ctx context.Context, req domain.CreateDeploymentRequest) (domain.Deployment, error) {
+-	return s.repo.CreateDeployment(ctx, req)
++	return domain.Deployment{}, fmt.Errorf("deployment execution is disabled until a real ArgoCD or Kubernetes adapter is connected")
+ }
+ 
+ func (s *ModuleService) ListSecurityAlerts(ctx context.Context) ([]domain.SecurityAlert, error) {
+@@ -44,7 +45,7 @@ func (s *ModuleService) ListSecurityAlerts(ctx context.Context) ([]domain.Securi
+ }
+ 
+ func (s *ModuleService) RunSecurityScan(ctx context.Context, req domain.CreateSecurityScanRequest) (domain.SecurityAlert, error) {
+-	return s.repo.CreateSecurityAlert(ctx, req)
++	return domain.SecurityAlert{}, fmt.Errorf("security scanning is disabled until a real scanner adapter is connected")
+ }
+ 
+ func (s *ModuleService) UpdateSecurityAlertStatus(ctx context.Context, id string, req domain.UpdateAlertStatusRequest) (domain.SecurityAlert, error) {
+@@ -58,3 +59,11 @@ func (s *ModuleService) ListObservabilitySignals(ctx context.Context) ([]domain.
+ func (s *ModuleService) ListRegistryArtifacts(ctx context.Context) ([]domain.RegistryArtifact, error) {
+ 	return s.repo.ListRegistryArtifacts(ctx)
+ }
++
++func (s *ModuleService) ListSettings(ctx context.Context) ([]domain.Setting, error) {
++	return s.repo.ListSettings(ctx)
++}
++
++func (s *ModuleService) UpsertSetting(ctx context.Context, key string, req domain.UpdateSettingRequest) (domain.Setting, error) {
++	return s.repo.UpsertSetting(ctx, key, req)
++}
+diff --git a/apps/api/internal/application/overview_service.go b/apps/api/internal/application/overview_service.go
+index 1242ea1..b7c98b0 100644
+--- a/apps/api/internal/application/overview_service.go
++++ b/apps/api/internal/application/overview_service.go
+@@ -48,11 +48,6 @@ func (s *OverviewService) GetOverview(ctx context.Context) (domain.Overview, err
+ 		return domain.Overview{}, err
+ 	}
+ 
+-	deploymentsCount, err := s.repo.CountDeployments(ctx)
+-	if err != nil {
+-		return domain.Overview{}, err
+-	}
+-
+ 	deploymentStatus, err := s.repo.CountDeploymentsByHealth(ctx)
+ 	if err != nil {
+ 		return domain.Overview{}, err
+@@ -78,21 +73,18 @@ func (s *OverviewService) GetOverview(ctx context.Context) (domain.Overview, err
+ 		return domain.Overview{}, err
+ 	}
+ 
+-	nodes := max(1, clustersCount*4)
+-	pods := max(1, deploymentsCount*13)
+-
+ 	overview := domain.Overview{
+ 		ApplicationsCount: applicationsCount,
+ 		ClustersCount:     clustersCount,
+-		NodesCount:        nodes,
+-		PodsCount:         pods,
++		NodesCount:        0,
++		PodsCount:         0,
+ 		DeploymentStatus:  deploymentStatus,
+ 		PipelineStatus:    pipelineStatus,
+ 		SecuritySeverity:  securitySeverity,
+ 		ResourceUsage: map[string]int{
+-			"cpu":     min(92, 25+deploymentsCount*4),
+-			"memory":  min(94, 35+applicationsCount*5),
+-			"storage": min(89, 31+applicationsCount*3),
++			"cpu":     0,
++			"memory":  0,
++			"storage": 0,
+ 		},
+ 		RecentAlerts: recentAlerts,
+ 		Integrations: integrationList,
+@@ -105,17 +97,3 @@ func (s *OverviewService) GetOverview(ctx context.Context) (domain.Overview, err
+ 
+ 	return overview, nil
+ }
+-
+-func min(a, b int) int {
+-	if a < b {
+-		return a
+-	}
+-	return b
+-}
+-
+-func max(a, b int) int {
+-	if a > b {
+-		return a
+-	}
+-	return b
+-}
+diff --git a/apps/api/internal/config/config.go b/apps/api/internal/config/config.go
+index 1dc66c3..6fc774e 100644
+--- a/apps/api/internal/config/config.go
++++ b/apps/api/internal/config/config.go
+@@ -1,39 +1,218 @@
+ package config
+ 
+-import "os"
++import (
++	"errors"
++	"fmt"
++	"net/url"
++	"os"
++	"strconv"
++	"strings"
++	"time"
++)
++
++const (
++	EnvLocal      = "local"
++	EnvProduction = "production"
++
++	ModeDemo       = "demo"
++	ModeLab        = "lab"
++	ModeProduction = "production"
++)
++
++var defaultSensitiveValues = []string{
++	"sentinelops",
++	"sentinelops-local-dev-key-change-me",
++	"change-me",
++	"changeme",
++}
+ 
+ type Config struct {
+-	AppEnv            string
+-	APIPort           string
+-	DatabaseURL       string
+-	RedisAddr         string
+-	RedisPassword     string
+-	AuthEnabled       bool
+-	KeycloakIssuerURL string
+-	KeycloakClientID  string
+-	PlatformMode      string
+-	EncryptionKey     string
++	AppEnv             string
++	APIPort            string
++	DatabaseURL        string
++	RedisAddr          string
++	RedisPassword      string
++	AuthEnabled        bool
++	BootstrapToken     string
++	KeycloakIssuerURL  string
++	KeycloakClientID   string
++	PlatformMode       string
++	EncryptionKey      string
++	AllowedOrigins     []string
++	RequestTimeout     time.Duration
++	IntegrationTimeout time.Duration
++	IntegrationRetries int
++	LogFormat          string
+ }
+ 
+ func Load() Config {
+-	return Config{
+-		AppEnv:            getEnv("APP_ENV", "local"),
+-		APIPort:           getEnv("API_PORT", "8080"),
+-		DatabaseURL:       getEnv("DATABASE_URL", "postgres://sentinelops:sentinelops@localhost:5432/sentinelops?sslmode=disable"),
+-		RedisAddr:         getEnv("REDIS_ADDR", "localhost:6379"),
+-		RedisPassword:     getEnv("REDIS_PASSWORD", ""),
+-		AuthEnabled:       getEnv("AUTH_ENABLED", "false") == "true",
+-		KeycloakIssuerURL: getEnv("KEYCLOAK_ISSUER_URL", "http://localhost:8081/realms/sentinelops"),
+-		KeycloakClientID:  getEnv("KEYCLOAK_CLIENT_ID", "sentinelops-web"),
+-		PlatformMode:      getEnv("PLATFORM_MODE", "demo"),
+-		EncryptionKey:     getEnv("INTEGRATION_ENCRYPTION_KEY", "sentinelops-local-dev-key-change-me"),
++	cfg := Config{
++		AppEnv:             getEnv("APP_ENV", EnvLocal),
++		APIPort:            getEnv("API_PORT", "8080"),
++		DatabaseURL:        os.Getenv("DATABASE_URL"),
++		RedisAddr:          os.Getenv("REDIS_ADDR"),
++		RedisPassword:      os.Getenv("REDIS_PASSWORD"),
++		AuthEnabled:        getEnvBool("AUTH_ENABLED", false),
++		BootstrapToken:     os.Getenv("SENTINELOPS_BOOTSTRAP_TOKEN"),
++		KeycloakIssuerURL:  os.Getenv("KEYCLOAK_ISSUER_URL"),
++		KeycloakClientID:   os.Getenv("KEYCLOAK_CLIENT_ID"),
++		PlatformMode:       getEnv("PLATFORM_MODE", ModeDemo),
++		EncryptionKey:      os.Getenv("INTEGRATION_ENCRYPTION_KEY"),
++		AllowedOrigins:     splitCSV(os.Getenv("CORS_ALLOWED_ORIGINS")),
++		RequestTimeout:     getEnvDuration("REQUEST_TIMEOUT", 15*time.Second),
++		IntegrationTimeout: getEnvDuration("INTEGRATION_TIMEOUT", 8*time.Second),
++		IntegrationRetries: getEnvInt("INTEGRATION_RETRIES", 2),
++		LogFormat:          getEnv("LOG_FORMAT", "text"),
++	}
++	return cfg
++}
++
++func (c Config) Validate() error {
++	var issues []string
++	if c.APIPort == "" {
++		issues = append(issues, "API_PORT is required")
++	}
++	if c.DatabaseURL == "" {
++		issues = append(issues, "DATABASE_URL is required")
++	} else if _, err := url.Parse(c.DatabaseURL); err != nil {
++		issues = append(issues, fmt.Sprintf("DATABASE_URL is invalid: %v", err))
++	}
++	if c.RedisAddr == "" {
++		issues = append(issues, "REDIS_ADDR is required")
++	}
++	if c.EncryptionKey == "" {
++		issues = append(issues, "INTEGRATION_ENCRYPTION_KEY is required")
++	}
++	if !isAllowed(c.PlatformMode, ModeDemo, ModeLab, ModeProduction) {
++		issues = append(issues, "PLATFORM_MODE must be one of demo, lab, production")
++	}
++	if !isAllowed(c.AppEnv, EnvLocal, "development", "test", "staging", EnvProduction) {
++		issues = append(issues, "APP_ENV is invalid")
++	}
++	if c.IntegrationRetries < 0 || c.IntegrationRetries > 5 {
++		issues = append(issues, "INTEGRATION_RETRIES must be between 0 and 5")
++	}
++	if c.RequestTimeout < time.Second {
++		issues = append(issues, "REQUEST_TIMEOUT must be at least 1s")
++	}
++	if c.IntegrationTimeout < time.Second {
++		issues = append(issues, "INTEGRATION_TIMEOUT must be at least 1s")
++	}
++	if c.IsProduction() {
++		if !c.AuthEnabled {
++			issues = append(issues, "AUTH_ENABLED must be true in production")
++		}
++		if isDefaultSensitive(c.EncryptionKey) {
++			issues = append(issues, "INTEGRATION_ENCRYPTION_KEY must not use a default value in production")
++		}
++		if c.BootstrapToken == "" && strings.TrimSpace(c.KeycloakIssuerURL) == "" {
++			issues = append(issues, "production auth requires SENTINELOPS_BOOTSTRAP_TOKEN or KEYCLOAK_ISSUER_URL")
++		}
++		if len(c.AllowedOrigins) == 0 {
++			issues = append(issues, "CORS_ALLOWED_ORIGINS is required in production")
++		}
++		for _, origin := range c.AllowedOrigins {
++			if origin == "*" {
++				issues = append(issues, "wildcard CORS origin is not allowed in production")
++			}
++		}
++	}
++	if len(issues) > 0 {
++		return errors.New(strings.Join(issues, "; "))
++	}
++	return nil
++}
++
++func (c Config) IsProduction() bool {
++	return c.AppEnv == EnvProduction || c.PlatformMode == ModeProduction
++}
++
++func (c Config) PublicRuntimeConfig() map[string]any {
++	return map[string]any{
++		"appEnv":               c.AppEnv,
++		"platformMode":         c.PlatformMode,
++		"authEnabled":          c.AuthEnabled,
++		"requestTimeoutMs":     c.RequestTimeout.Milliseconds(),
++		"integrationTimeoutMs": c.IntegrationTimeout.Milliseconds(),
++		"integrationRetries":   c.IntegrationRetries,
++		"logFormat":            c.LogFormat,
+ 	}
+ }
+ 
+ func getEnv(key string, fallback string) string {
+-	value := os.Getenv(key)
++	value := strings.TrimSpace(os.Getenv(key))
+ 	if value == "" {
+ 		return fallback
+ 	}
+ 	return value
+ }
++
++func getEnvBool(key string, fallback bool) bool {
++	value := strings.TrimSpace(os.Getenv(key))
++	if value == "" {
++		return fallback
++	}
++	parsed, err := strconv.ParseBool(value)
++	if err != nil {
++		return fallback
++	}
++	return parsed
++}
++
++func getEnvInt(key string, fallback int) int {
++	value := strings.TrimSpace(os.Getenv(key))
++	if value == "" {
++		return fallback
++	}
++	parsed, err := strconv.Atoi(value)
++	if err != nil {
++		return fallback
++	}
++	return parsed
++}
++
++func getEnvDuration(key string, fallback time.Duration) time.Duration {
++	value := strings.TrimSpace(os.Getenv(key))
++	if value == "" {
++		return fallback
++	}
++	parsed, err := time.ParseDuration(value)
++	if err != nil {
++		return fallback
++	}
++	return parsed
++}
++
++func splitCSV(value string) []string {
++	if strings.TrimSpace(value) == "" {
++		return nil
++	}
++	parts := strings.Split(value, ",")
++	result := make([]string, 0, len(parts))
++	for _, part := range parts {
++		part = strings.TrimSpace(part)
++		if part != "" {
++			result = append(result, part)
++		}
++	}
++	return result
++}
++
++func isAllowed(value string, options ...string) bool {
++	for _, option := range options {
++		if value == option {
++			return true
++		}
++	}
++	return false
++}
++
++func isDefaultSensitive(value string) bool {
++	value = strings.ToLower(strings.TrimSpace(value))
++	for _, candidate := range defaultSensitiveValues {
++		if value == candidate {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/apps/api/internal/config/config_test.go b/apps/api/internal/config/config_test.go
+new file mode 100644
+index 0000000..e0850f4
+--- /dev/null
++++ b/apps/api/internal/config/config_test.go
+@@ -0,0 +1,34 @@
++package config
++
++import "testing"
++
++func TestValidateRequiresDatabaseURL(t *testing.T) {
++	cfg := Config{
++		AppEnv:             EnvLocal,
++		APIPort:            "8080",
++		RedisAddr:          "redis:6379",
++		PlatformMode:       ModeDemo,
++		EncryptionKey:      "test-encryption-key",
++		RequestTimeout:     1,
++		IntegrationTimeout: 1,
++	}
++	if err := cfg.Validate(); err == nil {
++		t.Fatal("expected missing database URL to fail validation")
++	}
++}
++
++func TestValidateRejectsProductionDefaults(t *testing.T) {
++	cfg := Config{
++		AppEnv:             EnvProduction,
++		APIPort:            "8080",
++		DatabaseURL:        "postgres://user:pass@postgres:5432/db",
++		RedisAddr:          "redis:6379",
++		PlatformMode:       ModeProduction,
++		EncryptionKey:      "change-me",
++		RequestTimeout:     1,
++		IntegrationTimeout: 1,
++	}
++	if err := cfg.Validate(); err == nil {
++		t.Fatal("expected production default secret validation failure")
++	}
++}
+diff --git a/apps/api/internal/domain/integration_models.go b/apps/api/internal/domain/integration_models.go
+index f2ef10e..dc03580 100644
+--- a/apps/api/internal/domain/integration_models.go
++++ b/apps/api/internal/domain/integration_models.go
+@@ -51,6 +51,7 @@ type IntegrationHealth struct {
+ 	Healthy    bool              `json:"healthy"`
+ 	Message    string            `json:"message"`
+ 	CheckedAt  time.Time         `json:"checkedAt"`
++	LatencyMs  int               `json:"latencyMs"`
+ 	Attributes map[string]string `json:"attributes"`
+ }
+ 
+@@ -92,3 +93,42 @@ type UpdateIntegrationRequest struct {
+ type SetIntegrationEnabledRequest struct {
+ 	Enabled bool `json:"enabled"`
+ }
++
++type Setting struct {
++	Key         string    `json:"key"`
++	Value       string    `json:"value"`
++	Environment string    `json:"environment"`
++	IsSensitive bool      `json:"isSensitive"`
++	UpdatedAt   time.Time `json:"updatedAt"`
++}
++
++type UpdateSettingRequest struct {
++	Value       string `json:"value" binding:"required"`
++	Environment string `json:"environment" binding:"omitempty,max=40"`
++	IsSensitive bool   `json:"isSensitive"`
++}
++
++type IntegrationStatusView struct {
++	ID            string     `json:"id"`
++	Status        string     `json:"status"`
++	Health        string     `json:"health"`
++	LastSyncAt    *time.Time `json:"lastSyncAt,omitempty"`
++	LastCheckedAt *time.Time `json:"lastCheckedAt,omitempty"`
++	Enabled       bool       `json:"enabled"`
++}
++
++type ConnectionHistory struct {
++	ID            string    `json:"id"`
++	IntegrationID string    `json:"integrationId"`
++	Action        string    `json:"action"`
++	Status        string    `json:"status"`
++	Message       string    `json:"message"`
++	LatencyMs     int       `json:"latencyMs"`
++	CheckedAt     time.Time `json:"checkedAt"`
++}
++
++type IntegrationType struct {
++	Type        string `json:"type"`
++	Category    string `json:"category"`
++	Description string `json:"description"`
++}
+diff --git a/apps/api/internal/platform/auth/middleware.go b/apps/api/internal/platform/auth/middleware.go
+index df832da..5fe94f9 100644
+--- a/apps/api/internal/platform/auth/middleware.go
++++ b/apps/api/internal/platform/auth/middleware.go
+@@ -1,6 +1,8 @@
+ package auth
+ 
+ import (
++	"context"
++	"crypto/subtle"
+ 	"net/http"
+ 	"strings"
+ 
+@@ -12,30 +14,98 @@ type Middleware struct {
+ 	cfg config.Config
+ }
+ 
++type Principal struct {
++	Name        string
++	Role        string
++	Permissions map[string]bool
++}
++
+ func NewMiddleware(cfg config.Config) *Middleware {
+ 	return &Middleware{cfg: cfg}
+ }
+ 
+ func (m *Middleware) RequireAuth() gin.HandlerFunc {
+ 	return func(c *gin.Context) {
+-		if !m.cfg.AuthEnabled {
+-			c.Set("principal", "local-admin")
+-			c.Set("role", "admin")
+-			c.Next()
++		principal, ok := m.principalFromRequest(c)
++		if !ok {
++			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+ 			return
+ 		}
++		c.Set("principal", principal.Name)
++		c.Set("role", principal.Role)
++		c.Set("permissions", principal.Permissions)
++		ctx := context.WithValue(c.Request.Context(), "actor", principal.Name)
++		c.Request = c.Request.WithContext(ctx)
++		c.Next()
++	}
++}
+ 
+-		authorization := c.GetHeader("Authorization")
+-		if !strings.HasPrefix(authorization, "Bearer ") {
+-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing bearer token"})
++func (m *Middleware) RequirePermission(required ...string) gin.HandlerFunc {
++	return func(c *gin.Context) {
++		permissions, ok := c.Get("permissions")
++		if !ok {
++			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "permission context missing"})
+ 			return
+ 		}
++		permissionMap, ok := permissions.(map[string]bool)
++		if !ok {
++			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "invalid permission context"})
++			return
++		}
++		for _, permission := range required {
++			if permissionMap[permission] || permissionMap["*"] {
++				c.Next()
++				return
++			}
++		}
++		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "permission denied"})
++	}
++}
+ 
+-		// Production integration point:
+-		// Validate the JWT against Keycloak JWKS and check audience/issuer claims.
+-		// The middleware boundary is intentionally kept here so handlers remain auth-agnostic.
+-		c.Set("principal", "keycloak-user")
+-		c.Set("role", "platform-viewer")
+-		c.Next()
++func (m *Middleware) principalFromRequest(c *gin.Context) (Principal, bool) {
++	if !m.cfg.AuthEnabled {
++		role := strings.TrimSpace(c.GetHeader("X-User-Role"))
++		if role == "" {
++			role = "platform-admin"
++		}
++		return Principal{Name: "local-admin", Role: role, Permissions: permissionsForRole(role)}, true
++	}
++
++	authorization := strings.TrimSpace(c.GetHeader("Authorization"))
++	if !strings.HasPrefix(authorization, "Bearer ") {
++		return Principal{}, false
++	}
++	token := strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer "))
++	if m.cfg.BootstrapToken != "" && subtle.ConstantTimeCompare([]byte(token), []byte(m.cfg.BootstrapToken)) == 1 {
++		return Principal{Name: "bootstrap-admin", Role: "platform-admin", Permissions: permissionsForRole("platform-admin")}, true
++	}
++	return Principal{}, false
++}
++
++func permissionsForRole(role string) map[string]bool {
++	if role == "platform-admin" || role == "admin" {
++		return map[string]bool{"*": true}
++	}
++	baseRead := map[string]bool{
++		"platform:read":    true,
++		"settings:read":    true,
++		"integration:read": true,
++		"application:read": true,
++	}
++	switch role {
++	case "platform-engineer":
++		baseRead["settings:write"] = true
++		baseRead["integration:write"] = true
++		baseRead["integration:delete"] = true
++		baseRead["integration:operate"] = true
++		baseRead["application:write"] = true
++		baseRead["pipeline:operate"] = true
++		baseRead["deployment:operate"] = true
++	case "security-engineer":
++		baseRead["security:operate"] = true
++		baseRead["integration:operate"] = true
++	case "developer":
++		baseRead["pipeline:operate"] = true
+ 	}
++	return baseRead
+ }
+diff --git a/apps/api/internal/platform/crypto/secretbox.go b/apps/api/internal/platform/crypto/secretbox.go
+index 7421019..1dbafe9 100644
+--- a/apps/api/internal/platform/crypto/secretbox.go
++++ b/apps/api/internal/platform/crypto/secretbox.go
+@@ -16,7 +16,7 @@ type SecretBox struct {
+ 
+ func NewSecretBox(key string) (*SecretBox, error) {
+ 	if key == "" {
+-		key = "sentinelops-local-dev-key-change-me"
++		return nil, fmt.Errorf("secret encryption key is required")
+ 	}
+ 	digest := sha256.Sum256([]byte(key))
+ 	block, err := aes.NewCipher(digest[:])
+diff --git a/apps/api/internal/platform/crypto/secretbox_test.go b/apps/api/internal/platform/crypto/secretbox_test.go
+new file mode 100644
+index 0000000..412677c
+--- /dev/null
++++ b/apps/api/internal/platform/crypto/secretbox_test.go
+@@ -0,0 +1,30 @@
++package crypto
++
++import "testing"
++
++func TestSecretBoxEncryptDecrypt(t *testing.T) {
++	box, err := NewSecretBox("unit-test-secret")
++	if err != nil {
++		t.Fatalf("new secret box: %v", err)
++	}
++	ciphertext, err := box.Encrypt("secret-value")
++	if err != nil {
++		t.Fatalf("encrypt: %v", err)
++	}
++	if ciphertext == "" || ciphertext == "secret-value" {
++		t.Fatal("ciphertext must be non-empty and not equal plaintext")
++	}
++	plaintext, err := box.Decrypt(ciphertext)
++	if err != nil {
++		t.Fatalf("decrypt: %v", err)
++	}
++	if plaintext != "secret-value" {
++		t.Fatalf("unexpected plaintext: %s", plaintext)
++	}
++}
++
++func TestSecretBoxRequiresKey(t *testing.T) {
++	if _, err := NewSecretBox(""); err == nil {
++		t.Fatal("expected empty encryption key to fail")
++	}
++}
+diff --git a/apps/api/internal/platform/database/migrations.go b/apps/api/internal/platform/database/migrations.go
+new file mode 100644
+index 0000000..948d59e
+--- /dev/null
++++ b/apps/api/internal/platform/database/migrations.go
+@@ -0,0 +1,307 @@
++package database
++
++import (
++	"context"
++	"fmt"
++	"log/slog"
++	"strings"
++	"time"
++
++	"github.com/jackc/pgx/v5/pgxpool"
++)
++
++type Migration struct {
++	Version int
++	Name    string
++	SQL     string
++}
++
++var migrations = []Migration{
++	{
++		Version: 1,
++		Name:    "core_foundation_schema",
++		SQL: `
++		CREATE TABLE IF NOT EXISTS roles (
++			id TEXT PRIMARY KEY,
++			name TEXT NOT NULL UNIQUE,
++			description TEXT NOT NULL DEFAULT '',
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
++			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);
++		CREATE TABLE IF NOT EXISTS permissions (
++			id TEXT PRIMARY KEY,
++			name TEXT NOT NULL UNIQUE,
++			description TEXT NOT NULL DEFAULT '',
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);
++		CREATE TABLE IF NOT EXISTS role_permissions (
++			role_id TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
++			permission_id TEXT NOT NULL REFERENCES permissions(id) ON DELETE CASCADE,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
++			PRIMARY KEY (role_id, permission_id)
++		);
++		CREATE TABLE IF NOT EXISTS users (
++			id TEXT PRIMARY KEY,
++			email TEXT NOT NULL UNIQUE,
++			display_name TEXT NOT NULL,
++			role_id TEXT REFERENCES roles(id),
++			status TEXT NOT NULL DEFAULT 'active',
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
++			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);
++		CREATE TABLE IF NOT EXISTS user_roles (
++			user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++			role_id TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
++			PRIMARY KEY (user_id, role_id)
++		);
++		CREATE TABLE IF NOT EXISTS projects (
++			id TEXT PRIMARY KEY,
++			name TEXT NOT NULL UNIQUE,
++			owner_name TEXT NOT NULL,
++			environment TEXT NOT NULL,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
++			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);
++		CREATE TABLE IF NOT EXISTS clusters (
++			id TEXT PRIMARY KEY,
++			name TEXT NOT NULL UNIQUE,
++			provider TEXT NOT NULL,
++			region TEXT NOT NULL DEFAULT '',
++			kube_context TEXT NOT NULL DEFAULT '',
++			api_server_url TEXT NOT NULL DEFAULT '',
++			status TEXT NOT NULL DEFAULT 'unknown',
++			health_message TEXT NOT NULL DEFAULT '',
++			last_seen_at TIMESTAMPTZ,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
++			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);
++		CREATE TABLE IF NOT EXISTS applications (
++			id TEXT PRIMARY KEY,
++			project_id TEXT REFERENCES projects(id),
++			name TEXT NOT NULL UNIQUE,
++			owner_name TEXT NOT NULL,
++			repository TEXT NOT NULL,
++			environment TEXT NOT NULL,
++			status TEXT NOT NULL,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
++			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);
++		CREATE TABLE IF NOT EXISTS pipeline_runs (
++			id TEXT PRIMARY KEY,
++			application_id TEXT NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
++			branch TEXT NOT NULL,
++			commit_sha TEXT NOT NULL,
++			status TEXT NOT NULL,
++			stage TEXT NOT NULL,
++			duration_seconds INT NOT NULL,
++			finished_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);
++		CREATE TABLE IF NOT EXISTS deployments (
++			id TEXT PRIMARY KEY,
++			application_id TEXT NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
++			cluster_id TEXT REFERENCES clusters(id),
++			cluster_name TEXT NOT NULL,
++			namespace_name TEXT NOT NULL,
++			image TEXT NOT NULL,
++			version TEXT NOT NULL,
++			sync_status TEXT NOT NULL,
++			health_status TEXT NOT NULL,
++			deployed_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);
++		CREATE TABLE IF NOT EXISTS security_alerts (
++			id TEXT PRIMARY KEY,
++			source TEXT NOT NULL,
++			severity TEXT NOT NULL,
++			title TEXT NOT NULL,
++			application_name TEXT NOT NULL,
++			status TEXT NOT NULL,
++			detected_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);
++		CREATE TABLE IF NOT EXISTS observability_signals (
++			id TEXT PRIMARY KEY,
++			source TEXT NOT NULL,
++			signal_type TEXT NOT NULL,
++			status TEXT NOT NULL,
++			message TEXT NOT NULL,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);
++		CREATE TABLE IF NOT EXISTS notifications (
++			id TEXT PRIMARY KEY,
++			channel TEXT NOT NULL,
++			target TEXT NOT NULL,
++			enabled BOOLEAN NOT NULL DEFAULT true,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);
++		CREATE TABLE IF NOT EXISTS audit_logs (
++			id TEXT PRIMARY KEY,
++			actor TEXT NOT NULL DEFAULT 'system',
++			action TEXT NOT NULL,
++			resource_type TEXT NOT NULL,
++			resource_id TEXT NOT NULL,
++			message TEXT NOT NULL,
++			request_id TEXT NOT NULL DEFAULT '',
++			metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);
++		CREATE TABLE IF NOT EXISTS settings (
++			key TEXT PRIMARY KEY,
++			value TEXT NOT NULL,
++			environment TEXT NOT NULL DEFAULT 'global',
++			is_sensitive BOOLEAN NOT NULL DEFAULT false,
++			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);
++		CREATE TABLE IF NOT EXISTS integrations (
++			id TEXT PRIMARY KEY,
++			name TEXT NOT NULL,
++			tool_type TEXT NOT NULL,
++			category TEXT NOT NULL,
++			endpoint_url TEXT NOT NULL,
++			access_token_encrypted TEXT NOT NULL DEFAULT '',
++			username TEXT NOT NULL DEFAULT '',
++			password_encrypted TEXT NOT NULL DEFAULT '',
++			namespace TEXT NOT NULL DEFAULT '',
++			tls_verify BOOLEAN NOT NULL DEFAULT true,
++			sync_interval_seconds INT NOT NULL DEFAULT 60,
++			enabled BOOLEAN NOT NULL DEFAULT false,
++			status TEXT NOT NULL DEFAULT 'unknown',
++			mode TEXT NOT NULL DEFAULT 'demo',
++			last_health TEXT NOT NULL DEFAULT '',
++			last_health_checked_at TIMESTAMPTZ,
++			last_sync_at TIMESTAMPTZ,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
++			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);
++		CREATE TABLE IF NOT EXISTS integration_logs (
++			id TEXT PRIMARY KEY,
++			integration_id TEXT NOT NULL REFERENCES integrations(id) ON DELETE CASCADE,
++			action TEXT NOT NULL,
++			status TEXT NOT NULL,
++			message TEXT NOT NULL,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);
++		CREATE TABLE IF NOT EXISTS secrets_metadata (
++			id TEXT PRIMARY KEY,
++			resource_type TEXT NOT NULL,
++			resource_id TEXT NOT NULL,
++			secret_name TEXT NOT NULL,
++			provider TEXT NOT NULL DEFAULT 'postgres-encrypted',
++			status TEXT NOT NULL DEFAULT 'active',
++			rotated_at TIMESTAMPTZ,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
++			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);
++		CREATE TABLE IF NOT EXISTS connection_history (
++			id TEXT PRIMARY KEY,
++			integration_id TEXT NOT NULL REFERENCES integrations(id) ON DELETE CASCADE,
++			action TEXT NOT NULL,
++			status TEXT NOT NULL,
++			message TEXT NOT NULL,
++			latency_ms INT NOT NULL DEFAULT 0,
++			checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
++			metadata JSONB NOT NULL DEFAULT '{}'::jsonb
++		);
++		CREATE TABLE IF NOT EXISTS health_status (
++			id TEXT PRIMARY KEY,
++			component_type TEXT NOT NULL,
++			component_id TEXT NOT NULL,
++			status TEXT NOT NULL,
++			message TEXT NOT NULL,
++			checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
++			metadata JSONB NOT NULL DEFAULT '{}'::jsonb
++		);`,
++	},
++	{
++		Version: 2,
++		Name:    "indexes_and_compatibility_alters",
++		SQL: `
++		ALTER TABLE roles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
++		ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
++		ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
++		ALTER TABLE projects ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
++		ALTER TABLE clusters ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
++		ALTER TABLE settings ADD COLUMN IF NOT EXISTS environment TEXT NOT NULL DEFAULT 'global';
++		ALTER TABLE settings ADD COLUMN IF NOT EXISTS is_sensitive BOOLEAN NOT NULL DEFAULT false;
++		ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS request_id TEXT NOT NULL DEFAULT '';
++		ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
++		ALTER TABLE integrations ADD COLUMN IF NOT EXISTS last_health_checked_at TIMESTAMPTZ;
++		ALTER TABLE clusters ADD COLUMN IF NOT EXISTS api_server_url TEXT NOT NULL DEFAULT '';
++		ALTER TABLE clusters ADD COLUMN IF NOT EXISTS health_message TEXT NOT NULL DEFAULT '';
++		ALTER TABLE clusters ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
++		ALTER TABLE applications ADD COLUMN IF NOT EXISTS project_id TEXT REFERENCES projects(id);
++		ALTER TABLE applications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
++		ALTER TABLE deployments ADD COLUMN IF NOT EXISTS cluster_id TEXT REFERENCES clusters(id);
++
++		CREATE UNIQUE INDEX IF NOT EXISTS idx_integrations_name_lower ON integrations (lower(name));
++		CREATE INDEX IF NOT EXISTS idx_integrations_status ON integrations(status);
++		CREATE INDEX IF NOT EXISTS idx_integrations_enabled ON integrations(enabled);
++		CREATE INDEX IF NOT EXISTS idx_integration_logs_integration_id ON integration_logs(integration_id);
++		CREATE INDEX IF NOT EXISTS idx_connection_history_integration_id ON connection_history(integration_id, checked_at DESC);
++		CREATE INDEX IF NOT EXISTS idx_health_status_component ON health_status(component_type, component_id, checked_at DESC);
++		CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);
++		CREATE INDEX IF NOT EXISTS idx_pipeline_runs_application_id ON pipeline_runs(application_id);
++		CREATE INDEX IF NOT EXISTS idx_deployments_application_id ON deployments(application_id);
++		CREATE INDEX IF NOT EXISTS idx_security_alerts_detected_at ON security_alerts(detected_at DESC);
++		CREATE INDEX IF NOT EXISTS idx_settings_environment ON settings(environment);`,
++	},
++}
++
++func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
++	if _, err := pool.Exec(ctx, `
++		CREATE TABLE IF NOT EXISTS schema_migrations (
++			version INT PRIMARY KEY,
++			name TEXT NOT NULL,
++			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);`); err != nil {
++		return fmt.Errorf("create schema_migrations: %w", err)
++	}
++
++	for _, migration := range migrations {
++		applied, err := migrationApplied(ctx, pool, migration.Version)
++		if err != nil {
++			return err
++		}
++		if applied {
++			continue
++		}
++		if err := applyMigration(ctx, pool, migration); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func migrationApplied(ctx context.Context, pool *pgxpool.Pool, version int) (bool, error) {
++	var exists bool
++	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, version).Scan(&exists); err != nil {
++		return false, fmt.Errorf("check migration %d: %w", version, err)
++	}
++	return exists, nil
++}
++
++func applyMigration(ctx context.Context, pool *pgxpool.Pool, migration Migration) error {
++	start := time.Now()
++	tx, err := pool.Begin(ctx)
++	if err != nil {
++		return fmt.Errorf("begin migration %d: %w", migration.Version, err)
++	}
++	defer tx.Rollback(ctx)
++
++	for _, statement := range strings.Split(migration.SQL, ";") {
++		statement = strings.TrimSpace(statement)
++		if statement == "" {
++			continue
++		}
++		if _, err := tx.Exec(ctx, statement); err != nil {
++			return fmt.Errorf("apply migration %d %s: %w", migration.Version, migration.Name, err)
++		}
++	}
++	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations (version, name) VALUES ($1, $2)`, migration.Version, migration.Name); err != nil {
++		return fmt.Errorf("record migration %d: %w", migration.Version, err)
++	}
++	if err := tx.Commit(ctx); err != nil {
++		return fmt.Errorf("commit migration %d: %w", migration.Version, err)
++	}
++	slog.Info("database migration applied", "version", migration.Version, "name", migration.Name, "duration_ms", time.Since(start).Milliseconds())
++	return nil
++}
+diff --git a/apps/api/internal/platform/database/postgres.go b/apps/api/internal/platform/database/postgres.go
+index 9ef3019..63496ec 100644
+--- a/apps/api/internal/platform/database/postgres.go
++++ b/apps/api/internal/platform/database/postgres.go
+@@ -27,146 +27,3 @@ func Connect(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
+ 	}
+ 	return pool, nil
+ }
+-
+-func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
+-	statements := []string{
+-		`CREATE TABLE IF NOT EXISTS applications (
+-			id TEXT PRIMARY KEY,
+-			name TEXT NOT NULL UNIQUE,
+-			owner_name TEXT NOT NULL,
+-			repository TEXT NOT NULL,
+-			environment TEXT NOT NULL,
+-			status TEXT NOT NULL,
+-			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+-		);`,
+-		`CREATE TABLE IF NOT EXISTS pipeline_runs (
+-			id TEXT PRIMARY KEY,
+-			application_id TEXT NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+-			branch TEXT NOT NULL,
+-			commit_sha TEXT NOT NULL,
+-			status TEXT NOT NULL,
+-			stage TEXT NOT NULL,
+-			duration_seconds INT NOT NULL,
+-			finished_at TIMESTAMPTZ NOT NULL DEFAULT now()
+-		);`,
+-		`CREATE TABLE IF NOT EXISTS deployments (
+-			id TEXT PRIMARY KEY,
+-			application_id TEXT NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+-			cluster_name TEXT NOT NULL,
+-			namespace_name TEXT NOT NULL,
+-			image TEXT NOT NULL,
+-			version TEXT NOT NULL,
+-			sync_status TEXT NOT NULL,
+-			health_status TEXT NOT NULL,
+-			deployed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+-		);`,
+-		`CREATE TABLE IF NOT EXISTS security_alerts (
+-			id TEXT PRIMARY KEY,
+-			source TEXT NOT NULL,
+-			severity TEXT NOT NULL,
+-			title TEXT NOT NULL,
+-			application_name TEXT NOT NULL,
+-			status TEXT NOT NULL,
+-			detected_at TIMESTAMPTZ NOT NULL DEFAULT now()
+-		);`,
+-		`CREATE TABLE IF NOT EXISTS observability_signals (
+-			id TEXT PRIMARY KEY,
+-			source TEXT NOT NULL,
+-			signal_type TEXT NOT NULL,
+-			status TEXT NOT NULL,
+-			message TEXT NOT NULL,
+-			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+-		);`,
+-		`CREATE INDEX IF NOT EXISTS idx_pipeline_runs_application_id ON pipeline_runs(application_id);`,
+-		`CREATE INDEX IF NOT EXISTS idx_deployments_application_id ON deployments(application_id);`,
+-		`CREATE INDEX IF NOT EXISTS idx_security_alerts_detected_at ON security_alerts(detected_at DESC);`,
+-		`CREATE TABLE IF NOT EXISTS roles (
+-			id TEXT PRIMARY KEY,
+-			name TEXT NOT NULL UNIQUE,
+-			description TEXT NOT NULL DEFAULT '',
+-			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+-		);`,
+-		`CREATE TABLE IF NOT EXISTS users (
+-			id TEXT PRIMARY KEY,
+-			email TEXT NOT NULL UNIQUE,
+-			display_name TEXT NOT NULL,
+-			role_id TEXT REFERENCES roles(id),
+-			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+-		);`,
+-		`CREATE TABLE IF NOT EXISTS projects (
+-			id TEXT PRIMARY KEY,
+-			name TEXT NOT NULL UNIQUE,
+-			owner_name TEXT NOT NULL,
+-			environment TEXT NOT NULL,
+-			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+-		);`,
+-		`CREATE TABLE IF NOT EXISTS clusters (
+-			id TEXT PRIMARY KEY,
+-			name TEXT NOT NULL UNIQUE,
+-			provider TEXT NOT NULL,
+-			region TEXT NOT NULL DEFAULT '',
+-			kube_context TEXT NOT NULL DEFAULT '',
+-			status TEXT NOT NULL DEFAULT 'unknown',
+-			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+-		);`,
+-		`CREATE TABLE IF NOT EXISTS integrations (
+-			id TEXT PRIMARY KEY,
+-			name TEXT NOT NULL,
+-			tool_type TEXT NOT NULL,
+-			category TEXT NOT NULL,
+-			endpoint_url TEXT NOT NULL,
+-			access_token_encrypted TEXT NOT NULL DEFAULT '',
+-			username TEXT NOT NULL DEFAULT '',
+-			password_encrypted TEXT NOT NULL DEFAULT '',
+-			namespace TEXT NOT NULL DEFAULT '',
+-			tls_verify BOOLEAN NOT NULL DEFAULT true,
+-			sync_interval_seconds INT NOT NULL DEFAULT 60,
+-			enabled BOOLEAN NOT NULL DEFAULT false,
+-			status TEXT NOT NULL DEFAULT 'unknown',
+-			mode TEXT NOT NULL DEFAULT 'demo',
+-			last_health TEXT NOT NULL DEFAULT '',
+-			last_sync_at TIMESTAMPTZ,
+-			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+-			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+-		);`,
+-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_integrations_name_lower ON integrations (lower(name));`,
+-		`CREATE TABLE IF NOT EXISTS integration_logs (
+-			id TEXT PRIMARY KEY,
+-			integration_id TEXT NOT NULL REFERENCES integrations(id) ON DELETE CASCADE,
+-			action TEXT NOT NULL,
+-			status TEXT NOT NULL,
+-			message TEXT NOT NULL,
+-			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+-		);`,
+-		`CREATE TABLE IF NOT EXISTS notifications (
+-			id TEXT PRIMARY KEY,
+-			channel TEXT NOT NULL,
+-			target TEXT NOT NULL,
+-			enabled BOOLEAN NOT NULL DEFAULT true,
+-			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+-		);`,
+-		`CREATE TABLE IF NOT EXISTS audit_logs (
+-			id TEXT PRIMARY KEY,
+-			actor TEXT NOT NULL DEFAULT 'system',
+-			action TEXT NOT NULL,
+-			resource_type TEXT NOT NULL,
+-			resource_id TEXT NOT NULL,
+-			message TEXT NOT NULL,
+-			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+-		);`,
+-		`CREATE TABLE IF NOT EXISTS settings (
+-			key TEXT PRIMARY KEY,
+-			value TEXT NOT NULL,
+-			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+-		);`,
+-		`CREATE INDEX IF NOT EXISTS idx_integration_logs_integration_id ON integration_logs(integration_id);`,
+-		`CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);`,
+-	}
+-
+-	for _, statement := range statements {
+-		if _, err := pool.Exec(ctx, statement); err != nil {
+-			return err
+-		}
+-	}
+-	return nil
+-}
+diff --git a/apps/api/internal/platform/database/repository.go b/apps/api/internal/platform/database/repository.go
+index 73f6a4e..ec55987 100644
+--- a/apps/api/internal/platform/database/repository.go
++++ b/apps/api/internal/platform/database/repository.go
+@@ -5,6 +5,7 @@ import (
+ 	"crypto/rand"
+ 	stdsql "database/sql"
+ 	"encoding/hex"
++	"encoding/json"
+ 	"fmt"
+ 	"strings"
+ 
+@@ -151,7 +152,7 @@ func (r *Repository) CreateDeployment(ctx context.Context, req domain.CreateDepl
+ 	cluster := valueOr(req.Cluster, "k3s-prod-01")
+ 	namespace := valueOr(req.Namespace, strings.TrimSuffix(appName, "-service"))
+ 	version := valueOr(req.Version, "v0.1."+fmt.Sprint(int(randomByte()%9)+1))
+-	image := "harbor.local/sentinelops/" + appName
++	image := appName
+ 
+ 	item := domain.Deployment{
+ 		ID:              "dep-" + randomHex(8),
+@@ -291,6 +292,24 @@ func (r *Repository) ListRegistryArtifacts(ctx context.Context) ([]domain.Regist
+ 	return items, rows.Err()
+ }
+ 
++func (r *Repository) HasEnabledIntegrationType(ctx context.Context, toolTypes ...string) (bool, error) {
++	if len(toolTypes) == 0 {
++		return false, nil
++	}
++	placeholders := make([]string, 0, len(toolTypes))
++	args := make([]any, 0, len(toolTypes))
++	for index, toolType := range toolTypes {
++		placeholders = append(placeholders, fmt.Sprintf("$%d", index+1))
++		args = append(args, toolType)
++	}
++	query := fmt.Sprintf(`SELECT EXISTS(SELECT 1 FROM integrations WHERE enabled = true AND tool_type IN (%s))`, strings.Join(placeholders, ","))
++	var exists bool
++	if err := r.pool.QueryRow(ctx, query, args...).Scan(&exists); err != nil {
++		return false, err
++	}
++	return exists, nil
++}
++
+ func (r *Repository) CountApplications(ctx context.Context) (int, error) {
+ 	var count int
+ 	err := r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM applications`).Scan(&count)
+@@ -299,7 +318,7 @@ func (r *Repository) CountApplications(ctx context.Context) (int, error) {
+ 
+ func (r *Repository) CountClusters(ctx context.Context) (int, error) {
+ 	var count int
+-	err := r.pool.QueryRow(ctx, `SELECT COALESCE(COUNT(DISTINCT cluster_name), 0) FROM deployments`).Scan(&count)
++	err := r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM clusters`).Scan(&count)
+ 	return count, err
+ }
+ 
+@@ -463,6 +482,12 @@ func (r *Repository) CreateIntegration(ctx context.Context, cfg domain.Integrati
+ 	}
+ 	_ = r.CreateIntegrationLog(ctx, created.ID, "create", created.Status, "integration configuration saved")
+ 	_ = r.CreateAuditLog(ctx, "system", "create", "integration", created.ID, "integration created: "+created.Name)
++	if cfg.AccessToken != "" {
++		_ = r.UpsertSecretMetadata(ctx, "integration", created.ID, "access_token")
++	}
++	if cfg.Password != "" {
++		_ = r.UpsertSecretMetadata(ctx, "integration", created.ID, "password")
++	}
+ 	return created, nil
+ }
+ 
+@@ -496,6 +521,12 @@ func (r *Repository) UpdateIntegration(ctx context.Context, cfg domain.Integrati
+ 	}
+ 	_ = r.CreateIntegrationLog(ctx, updated.ID, "update", updated.Status, "integration configuration updated")
+ 	_ = r.CreateAuditLog(ctx, "system", "update", "integration", updated.ID, "integration updated: "+updated.Name)
++	if cfg.AccessToken != "" {
++		_ = r.UpsertSecretMetadata(ctx, "integration", updated.ID, "access_token")
++	}
++	if cfg.Password != "" {
++		_ = r.UpsertSecretMetadata(ctx, "integration", updated.ID, "password")
++	}
+ 	return updated, nil
+ }
+ 
+@@ -533,16 +564,18 @@ func (r *Repository) SetIntegrationEnabled(ctx context.Context, id string, enabl
+ func (r *Repository) UpdateIntegrationHealth(ctx context.Context, id string, health domain.IntegrationHealth) (domain.IntegrationConfig, error) {
+ 	row := r.pool.QueryRow(ctx, `
+ 		UPDATE integrations
+-		SET status = $2, last_health = $3, updated_at = now()
++		SET status = $2, last_health = $3, last_health_checked_at = $4, updated_at = now()
+ 		WHERE id = $1
+ 		RETURNING id, name, tool_type, category, endpoint_url, username, namespace, tls_verify,
+ 			sync_interval_seconds, enabled, status, mode, last_health, last_sync_at, created_at, updated_at,
+-			access_token_encrypted <> '', password_encrypted <> ''`, id, health.Status, health.Message)
++			access_token_encrypted <> '', password_encrypted <> ''`, id, health.Status, health.Message, health.CheckedAt)
+ 	updated, err := scanIntegrationPublic(row)
+ 	if err != nil {
+ 		return domain.IntegrationConfig{}, err
+ 	}
+ 	_ = r.CreateIntegrationLog(ctx, id, "health", health.Status, health.Message)
++	_ = r.CreateConnectionHistory(ctx, id, "health", health.Status, health.Message, health.LatencyMs, health.Attributes)
++	_ = r.CreateHealthStatus(ctx, "integration", id, health.Status, health.Message, health.Attributes)
+ 	return updated, nil
+ }
+ 
+@@ -559,6 +592,14 @@ func (r *Repository) MarkIntegrationSynced(ctx context.Context, id string, sync
+ 		return domain.IntegrationConfig{}, err
+ 	}
+ 	_ = r.CreateIntegrationLog(ctx, id, "sync", sync.Status, sync.Message)
++	metadata := map[string]string{}
++	for key, value := range sync.Metadata {
++		metadata[key] = value
++	}
++	for key, value := range sync.Resources {
++		metadata["resource_"+key] = fmt.Sprintf("%d", value)
++	}
++	_ = r.CreateConnectionHistory(ctx, id, "sync", sync.Status, sync.Message, 0, metadata)
+ 	return updated, nil
+ }
+ 
+@@ -593,9 +634,13 @@ func (r *Repository) ListIntegrationLogs(ctx context.Context, integrationID stri
+ }
+ 
+ func (r *Repository) CreateAuditLog(ctx context.Context, actor string, action string, resourceType string, resourceID string, message string) error {
++	if actor == "" || actor == "system" {
++		actor = contextValue(ctx, "actor", actor)
++	}
++	requestID := contextValue(ctx, "request_id", "")
+ 	_, err := r.pool.Exec(ctx, `
+-		INSERT INTO audit_logs (id, actor, action, resource_type, resource_id, message)
+-		VALUES ($1, $2, $3, $4, $5, $6)`, "audit-"+randomHex(8), actor, action, resourceType, resourceID, message)
++		INSERT INTO audit_logs (id, actor, action, resource_type, resource_id, message, request_id)
++		VALUES ($1, $2, $3, $4, $5, $6, $7)`, "audit-"+randomHex(8), actor, action, resourceType, resourceID, message, requestID)
+ 	return err
+ }
+ 
+@@ -637,3 +682,114 @@ func scanIntegrationPrivate(row integrationPublicScanner) (domain.IntegrationCon
+ 	}
+ 	return item, nil
+ }
++
++func (r *Repository) ListSettings(ctx context.Context) ([]domain.Setting, error) {
++	rows, err := r.pool.Query(ctx, `
++		SELECT key, CASE WHEN is_sensitive THEN '' ELSE value END, environment, is_sensitive, updated_at
++		FROM settings
++		ORDER BY environment, key`)
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++
++	items := make([]domain.Setting, 0)
++	for rows.Next() {
++		var item domain.Setting
++		if err := rows.Scan(&item.Key, &item.Value, &item.Environment, &item.IsSensitive, &item.UpdatedAt); err != nil {
++			return nil, err
++		}
++		items = append(items, item)
++	}
++	return items, rows.Err()
++}
++
++func (r *Repository) UpsertSetting(ctx context.Context, key string, req domain.UpdateSettingRequest) (domain.Setting, error) {
++	environment := valueOr(req.Environment, "global")
++	row := r.pool.QueryRow(ctx, `
++		INSERT INTO settings (key, value, environment, is_sensitive, updated_at)
++		VALUES ($1, $2, $3, $4, now())
++		ON CONFLICT (key) DO UPDATE
++		SET value = EXCLUDED.value, environment = EXCLUDED.environment, is_sensitive = EXCLUDED.is_sensitive, updated_at = now()
++		RETURNING key, CASE WHEN is_sensitive THEN '' ELSE value END, environment, is_sensitive, updated_at`, key, req.Value, environment, req.IsSensitive)
++	var item domain.Setting
++	if err := row.Scan(&item.Key, &item.Value, &item.Environment, &item.IsSensitive, &item.UpdatedAt); err != nil {
++		return domain.Setting{}, err
++	}
++	_ = r.CreateAuditLog(ctx, "system", "upsert", "setting", key, "setting updated")
++	return item, nil
++}
++
++func (r *Repository) GetIntegrationStatus(ctx context.Context, id string) (domain.IntegrationStatusView, error) {
++	var item domain.IntegrationStatusView
++	var lastSync stdsql.NullTime
++	var lastChecked stdsql.NullTime
++	if err := r.pool.QueryRow(ctx, `
++		SELECT id, status, last_health, last_sync_at, last_health_checked_at, enabled
++		FROM integrations
++		WHERE id = $1`, id).Scan(&item.ID, &item.Status, &item.Health, &lastSync, &lastChecked, &item.Enabled); err != nil {
++		return domain.IntegrationStatusView{}, err
++	}
++	if lastSync.Valid {
++		item.LastSyncAt = &lastSync.Time
++	}
++	if lastChecked.Valid {
++		item.LastCheckedAt = &lastChecked.Time
++	}
++	return item, nil
++}
++
++func (r *Repository) CreateConnectionHistory(ctx context.Context, integrationID string, action string, status string, message string, latencyMs int, metadata map[string]string) error {
++	payload, _ := json.Marshal(metadata)
++	_, err := r.pool.Exec(ctx, `
++		INSERT INTO connection_history (id, integration_id, action, status, message, latency_ms, metadata)
++		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`, "conn-"+randomHex(8), integrationID, action, status, message, latencyMs, string(payload))
++	return err
++}
++
++func (r *Repository) ListConnectionHistory(ctx context.Context, integrationID string) ([]domain.ConnectionHistory, error) {
++	rows, err := r.pool.Query(ctx, `
++		SELECT id, integration_id, action, status, message, latency_ms, checked_at
++		FROM connection_history
++		WHERE integration_id = $1
++		ORDER BY checked_at DESC
++		LIMIT 100`, integrationID)
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++
++	items := make([]domain.ConnectionHistory, 0)
++	for rows.Next() {
++		var item domain.ConnectionHistory
++		if err := rows.Scan(&item.ID, &item.IntegrationID, &item.Action, &item.Status, &item.Message, &item.LatencyMs, &item.CheckedAt); err != nil {
++			return nil, err
++		}
++		items = append(items, item)
++	}
++	return items, rows.Err()
++}
++
++func (r *Repository) CreateHealthStatus(ctx context.Context, componentType string, componentID string, status string, message string, metadata map[string]string) error {
++	payload, _ := json.Marshal(metadata)
++	_, err := r.pool.Exec(ctx, `
++		INSERT INTO health_status (id, component_type, component_id, status, message, metadata)
++		VALUES ($1, $2, $3, $4, $5, $6::jsonb)`, "health-"+randomHex(8), componentType, componentID, status, message, string(payload))
++	return err
++}
++
++func (r *Repository) UpsertSecretMetadata(ctx context.Context, resourceType string, resourceID string, secretName string) error {
++	id := "secret-" + normalizeName(resourceType) + "-" + normalizeName(resourceID) + "-" + normalizeName(secretName)
++	_, err := r.pool.Exec(ctx, `
++		INSERT INTO secrets_metadata (id, resource_type, resource_id, secret_name, provider, status, rotated_at, updated_at)
++		VALUES ($1, $2, $3, $4, 'postgres-encrypted', 'active', now(), now())
++		ON CONFLICT (id) DO UPDATE SET status = 'active', rotated_at = now(), updated_at = now()`, id, resourceType, resourceID, secretName)
++	return err
++}
++
++func contextValue(ctx context.Context, key string, fallback string) string {
++	if value, ok := ctx.Value(key).(string); ok && value != "" {
++		return value
++	}
++	return fallback
++}
+diff --git a/apps/api/internal/platform/database/seed.go b/apps/api/internal/platform/database/seed.go
+index 94e173e..cfa9ce3 100644
+--- a/apps/api/internal/platform/database/seed.go
++++ b/apps/api/internal/platform/database/seed.go
+@@ -6,56 +6,66 @@ import (
+ 	"github.com/jackc/pgx/v5/pgxpool"
+ )
+ 
+-func Seed(ctx context.Context, pool *pgxpool.Pool) error {
+-	if err := seedCorePlatformData(ctx, pool); err != nil {
++func Seed(ctx context.Context, pool *pgxpool.Pool, platformMode string) error {
++	if err := seedRBAC(ctx, pool); err != nil {
+ 		return err
+ 	}
+-	if err := seedIntegrationCatalog(ctx, pool); err != nil {
+-		return err
+-	}
+-	return seedDefaultSettings(ctx, pool)
++	return seedDefaultSettings(ctx, pool, platformMode)
+ }
+ 
+-func seedCorePlatformData(ctx context.Context, pool *pgxpool.Pool) error {
+-	var count int
+-	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM applications`).Scan(&count); err != nil {
+-		return err
+-	}
+-	if count > 0 {
+-		return nil
++func seedRBAC(ctx context.Context, pool *pgxpool.Pool) error {
++	statements := []string{
++		`INSERT INTO roles (id, name, description) VALUES
++		('role-platform-admin', 'platform-admin', 'Full SentinelOps administration'),
++		('role-platform-engineer', 'platform-engineer', 'Platform operations and integration management'),
++		('role-security-engineer', 'security-engineer', 'Security findings and policy operations'),
++		('role-developer', 'developer', 'Application delivery workflows'),
++		('role-viewer', 'viewer', 'Read-only access')
++		ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description, updated_at = now();`,
++		`INSERT INTO permissions (id, name, description) VALUES
++		('perm-platform-read', 'platform:read', 'Read platform overview and health'),
++		('perm-settings-read', 'settings:read', 'Read platform settings'),
++		('perm-settings-write', 'settings:write', 'Update platform settings'),
++		('perm-integration-read', 'integration:read', 'Read integration configurations'),
++		('perm-integration-write', 'integration:write', 'Create and update integration configurations'),
++		('perm-integration-delete', 'integration:delete', 'Delete integration configurations'),
++		('perm-integration-operate', 'integration:operate', 'Test, sync, enable, and disable integrations'),
++		('perm-application-read', 'application:read', 'Read applications'),
++		('perm-application-write', 'application:write', 'Create and update applications'),
++		('perm-pipeline-operate', 'pipeline:operate', 'Operate pipeline actions'),
++		('perm-deployment-operate', 'deployment:operate', 'Operate deployment actions'),
++		('perm-security-operate', 'security:operate', 'Operate security actions'),
++		('perm-audit-read', 'audit:read', 'Read audit logs')
++		ON CONFLICT (id) DO NOTHING;`,
++		`INSERT INTO role_permissions (role_id, permission_id)
++		SELECT 'role-platform-admin', id FROM permissions
++		ON CONFLICT DO NOTHING;`,
++		`INSERT INTO role_permissions (role_id, permission_id) VALUES
++		('role-platform-engineer', 'perm-platform-read'),
++		('role-platform-engineer', 'perm-settings-read'),
++		('role-platform-engineer', 'perm-integration-read'),
++		('role-platform-engineer', 'perm-integration-write'),
++		('role-platform-engineer', 'perm-integration-operate'),
++		('role-platform-engineer', 'perm-application-read'),
++		('role-platform-engineer', 'perm-application-write'),
++		('role-platform-engineer', 'perm-pipeline-operate'),
++		('role-platform-engineer', 'perm-deployment-operate'),
++		('role-security-engineer', 'perm-platform-read'),
++		('role-security-engineer', 'perm-integration-read'),
++		('role-security-engineer', 'perm-security-operate'),
++		('role-developer', 'perm-platform-read'),
++		('role-developer', 'perm-application-read'),
++		('role-developer', 'perm-pipeline-operate'),
++		('role-viewer', 'perm-platform-read'),
++		('role-viewer', 'perm-settings-read'),
++		('role-viewer', 'perm-integration-read'),
++		('role-viewer', 'perm-application-read')
++		ON CONFLICT DO NOTHING;`,
++		`INSERT INTO users (id, email, display_name, role_id, status) VALUES
++		('user-local-admin', 'local-admin@sentinelops.internal', 'Local Platform Admin', 'role-platform-admin', 'active')
++		ON CONFLICT (id) DO UPDATE SET role_id = EXCLUDED.role_id, status = EXCLUDED.status, updated_at = now();`,
+ 	}
+-
+-	batch := []string{
+-		`INSERT INTO applications (id, name, owner_name, repository, environment, status) VALUES
+-		('app-checkout', 'checkout-service', 'platform-team', 'https://github.com/example/checkout-service', 'production', 'healthy'),
+-		('app-payments', 'payments-api', 'payments-team', 'https://github.com/example/payments-api', 'production', 'degraded'),
+-		('app-inventory', 'inventory-worker', 'supply-team', 'https://github.com/example/inventory-worker', 'staging', 'healthy'),
+-		('app-portal', 'developer-portal', 'platform-team', 'https://github.com/example/developer-portal', 'production', 'healthy');`,
+-		`INSERT INTO pipeline_runs (id, application_id, branch, commit_sha, status, stage, duration_seconds, finished_at) VALUES
+-		('pipe-001', 'app-checkout', 'main', 'a9f31c2', 'success', 'push-image', 412, now() - interval '15 minutes'),
+-		('pipe-002', 'app-payments', 'main', 'b71da3e', 'failed', 'semgrep-sast', 187, now() - interval '31 minutes'),
+-		('pipe-003', 'app-inventory', 'release/1.8', 'e83ac91', 'running', 'trivy-image-scan', 256, now() - interval '6 minutes'),
+-		('pipe-004', 'app-portal', 'main', 'c11be20', 'success', 'argocd-sync', 519, now() - interval '52 minutes'),
+-		('pipe-005', 'app-checkout', 'hotfix/cart', 'fae183a', 'pending', 'approval', 0, now() - interval '2 minutes');`,
+-		`INSERT INTO deployments (id, application_id, cluster_name, namespace_name, image, version, sync_status, health_status, deployed_at) VALUES
+-		('dep-001', 'app-checkout', 'k3s-prod-01', 'checkout', 'harbor.local/sentinelops/checkout-service', '1.4.2', 'synced', 'healthy', now() - interval '1 hour'),
+-		('dep-002', 'app-payments', 'k3s-prod-01', 'payments', 'harbor.local/sentinelops/payments-api', '2.1.0', 'out-of-sync', 'degraded', now() - interval '3 hours'),
+-		('dep-003', 'app-inventory', 'k3s-staging-01', 'inventory', 'harbor.local/sentinelops/inventory-worker', '1.8.0-rc2', 'synced', 'progressing', now() - interval '25 minutes'),
+-		('dep-004', 'app-portal', 'k3s-prod-01', 'platform', 'harbor.local/sentinelops/developer-portal', '0.9.5', 'synced', 'healthy', now() - interval '4 hours');`,
+-		`INSERT INTO security_alerts (id, source, severity, title, application_name, status, detected_at) VALUES
+-		('sec-001', 'Trivy', 'high', 'Base image contains critical OpenSSL CVE', 'payments-api', 'open', now() - interval '10 minutes'),
+-		('sec-002', 'Gitleaks', 'medium', 'Potential API token pattern detected', 'checkout-service', 'triaged', now() - interval '27 minutes'),
+-		('sec-003', 'Falco', 'high', 'Unexpected shell spawned in container', 'payments-api', 'open', now() - interval '4 minutes'),
+-		('sec-004', 'OPA Gatekeeper', 'low', 'Missing required cost-center label', 'inventory-worker', 'resolved', now() - interval '2 hours'),
+-		('sec-005', 'Semgrep', 'medium', 'Unsafe SQL construction pattern', 'developer-portal', 'open', now() - interval '48 minutes');`,
+-		`INSERT INTO observability_signals (id, source, signal_type, status, message, created_at) VALUES
+-		('obs-001', 'Prometheus', 'metric', 'healthy', 'Cluster CPU usage is within expected threshold', now() - interval '5 minutes'),
+-		('obs-002', 'Loki', 'log', 'warning', 'payments-api error rate increased in the last 15 minutes', now() - interval '9 minutes'),
+-		('obs-003', 'Tempo', 'trace', 'warning', 'checkout-service p95 latency above SLO target', now() - interval '14 minutes'),
+-		('obs-004', 'Grafana Alloy', 'agent', 'healthy', 'Telemetry pipeline is active for 4 namespaces', now() - interval '3 minutes');`,
+-	}
+-
+-	for _, statement := range batch {
++	for _, statement := range statements {
+ 		if _, err := pool.Exec(ctx, statement); err != nil {
+ 			return err
+ 		}
+@@ -63,36 +73,12 @@ func seedCorePlatformData(ctx context.Context, pool *pgxpool.Pool) error {
+ 	return nil
+ }
+ 
+-func seedIntegrationCatalog(ctx context.Context, pool *pgxpool.Pool) error {
+-	var count int
+-	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM integrations`).Scan(&count); err != nil {
+-		return err
+-	}
+-	if count > 0 {
+-		return nil
+-	}
+-
+-	_, err := pool.Exec(ctx, `INSERT INTO integrations
+-		(id, name, tool_type, category, endpoint_url, namespace, tls_verify, sync_interval_seconds, enabled, status, mode, last_health)
+-		VALUES
+-		('int-prometheus', 'Prometheus', 'Prometheus', 'Observability', 'http://prometheus:9090', 'monitoring', true, 60, false, 'disabled', 'demo', 'Not enabled yet'),
+-		('int-grafana', 'Grafana', 'Grafana', 'Observability', 'http://grafana:3000', 'monitoring', true, 60, false, 'disabled', 'demo', 'Not enabled yet'),
+-		('int-harbor', 'Harbor', 'Harbor', 'Registry', 'http://harbor.local', 'registry', true, 300, false, 'disabled', 'demo', 'Not enabled yet'),
+-		('int-argocd', 'Argo CD', 'ArgoCD', 'GitOps', 'http://argocd-server.argocd.svc.cluster.local', 'argocd', true, 60, false, 'disabled', 'demo', 'Not enabled yet'),
+-		('int-vault', 'Vault/OpenBao', 'Vault', 'Secrets', 'http://vault:8200', 'vault', true, 300, false, 'disabled', 'demo', 'Not enabled yet'),
+-		('int-github', 'GitHub', 'GitHub', 'SCM', 'https://api.github.com', '', true, 300, false, 'disabled', 'demo', 'Not enabled yet'),
+-		('int-sonarqube', 'SonarQube', 'SonarQube', 'Code Quality', 'http://sonarqube:9000', 'quality', true, 300, false, 'disabled', 'demo', 'Not enabled yet'),
+-		('int-wazuh', 'Wazuh', 'Wazuh', 'SIEM', 'http://wazuh-manager:55000', 'security', true, 300, false, 'disabled', 'demo', 'Not enabled yet'),
+-		('int-falco', 'Falco', 'Falco', 'Runtime Security', 'http://falco-exporter:9376', 'security', true, 60, false, 'disabled', 'demo', 'Not enabled yet')
+-		ON CONFLICT (id) DO NOTHING;`)
+-	return err
+-}
+-
+-func seedDefaultSettings(ctx context.Context, pool *pgxpool.Pool) error {
+-	_, err := pool.Exec(ctx, `INSERT INTO settings (key, value) VALUES
+-		('environment_mode', 'demo'),
+-		('default_namespace', 'sentinelops'),
+-		('audit_retention_days', '90')
+-		ON CONFLICT (key) DO NOTHING;`)
++func seedDefaultSettings(ctx context.Context, pool *pgxpool.Pool, platformMode string) error {
++	_, err := pool.Exec(ctx, `INSERT INTO settings (key, value, environment, is_sensitive) VALUES
++		('environment_mode', $1, 'global', false),
++		('default_namespace', 'sentinelops', 'global', false),
++		('audit_retention_days', '90', 'global', false),
++		('integration_retry_policy', 'exponential-backoff', 'global', false)
++		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, environment = EXCLUDED.environment, updated_at = now();`, platformMode)
+ 	return err
+ }
+diff --git a/apps/api/internal/platform/http/middleware.go b/apps/api/internal/platform/http/middleware.go
+index a438a79..c240fb5 100644
+--- a/apps/api/internal/platform/http/middleware.go
++++ b/apps/api/internal/platform/http/middleware.go
+@@ -1,8 +1,12 @@
+ package http
+ 
+ import (
++	"context"
+ 	"crypto/rand"
+ 	"encoding/hex"
++	"log/slog"
++	"net/http"
++	"time"
+ 
+ 	"github.com/gin-gonic/gin"
+ )
+@@ -14,10 +18,39 @@ func requestID() gin.HandlerFunc {
+ 			requestID = newRequestID()
+ 		}
+ 		c.Writer.Header().Set("X-Request-ID", requestID)
++		ctx := context.WithValue(c.Request.Context(), "request_id", requestID)
++		c.Request = c.Request.WithContext(ctx)
+ 		c.Next()
+ 	}
+ }
+ 
++func requestLogger(logger *slog.Logger) gin.HandlerFunc {
++	return func(c *gin.Context) {
++		start := time.Now()
++		c.Next()
++		logger.Info("http request",
++			"request_id", c.Writer.Header().Get("X-Request-ID"),
++			"method", c.Request.Method,
++			"path", c.Request.URL.Path,
++			"status", c.Writer.Status(),
++			"latency_ms", time.Since(start).Milliseconds(),
++			"client_ip", c.ClientIP(),
++		)
++	}
++}
++
++func requestTimeout(timeout time.Duration) gin.HandlerFunc {
++	return func(c *gin.Context) {
++		ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
++		defer cancel()
++		c.Request = c.Request.WithContext(ctx)
++		c.Next()
++		if ctx.Err() == context.DeadlineExceeded && !c.Writer.Written() {
++			c.AbortWithStatusJSON(http.StatusGatewayTimeout, gin.H{"error": "request timeout"})
++		}
++	}
++}
++
+ func newRequestID() string {
+ 	buf := make([]byte, 12)
+ 	if _, err := rand.Read(buf); err != nil {
+diff --git a/apps/api/internal/platform/http/router.go b/apps/api/internal/platform/http/router.go
+index becab21..1f82a11 100644
+--- a/apps/api/internal/platform/http/router.go
++++ b/apps/api/internal/platform/http/router.go
+@@ -1,10 +1,15 @@
+ package http
+ 
+ import (
++	"context"
++	"errors"
++	"log/slog"
+ 	"net/http"
++	"time"
+ 
+ 	"github.com/gin-contrib/cors"
+ 	"github.com/gin-gonic/gin"
++	"github.com/redis/go-redis/v9"
+ 	"github.com/sentinelops/sentinelops/apps/api/internal/application"
+ 	"github.com/sentinelops/sentinelops/apps/api/internal/config"
+ 	"github.com/sentinelops/sentinelops/apps/api/internal/domain"
+@@ -12,55 +17,75 @@ import (
+ )
+ 
+ type Handler struct {
++	cfg          config.Config
+ 	overview     *application.OverviewService
+ 	modules      *application.ModuleService
+ 	integrations *application.IntegrationService
++	redis        *redis.Client
+ }
+ 
+-func NewRouter(cfg config.Config, overview *application.OverviewService, modules *application.ModuleService, integrations *application.IntegrationService, authMiddleware *auth.Middleware) *gin.Engine {
+-	if cfg.AppEnv == "production" {
++func NewRouter(cfg config.Config, overview *application.OverviewService, modules *application.ModuleService, integrations *application.IntegrationService, authMiddleware *auth.Middleware, redisClient *redis.Client, logger *slog.Logger) *gin.Engine {
++	if cfg.AppEnv == config.EnvProduction {
+ 		gin.SetMode(gin.ReleaseMode)
+ 	}
+ 
+ 	router := gin.New()
+ 	router.Use(gin.Recovery())
+ 	router.Use(requestID())
+-	router.Use(cors.New(cors.Config{
+-		AllowOrigins:     []string{"http://localhost:3000", "http://127.0.0.1:3000"},
+-		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+-		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-User-Role"},
+-		ExposeHeaders:    []string{"X-Request-ID"},
+-		AllowCredentials: true,
+-	}))
++	router.Use(requestTimeout(cfg.RequestTimeout))
++	router.Use(requestLogger(logger))
++	if len(cfg.AllowedOrigins) > 0 {
++		router.Use(cors.New(cors.Config{
++			AllowOrigins:     cfg.AllowedOrigins,
++			AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
++			AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-User-Role", "X-Request-ID"},
++			ExposeHeaders:    []string{"X-Request-ID"},
++			AllowCredentials: true,
++		}))
++	}
+ 
+-	h := &Handler{overview: overview, modules: modules, integrations: integrations}
++	h := &Handler{cfg: cfg, overview: overview, modules: modules, integrations: integrations, redis: redisClient}
+ 
+ 	router.GET("/health", h.health)
++	router.GET("/ready", h.readiness)
++	router.GET("/live", h.liveness)
+ 
+ 	v1 := router.Group("/api/v1")
+ 	v1.Use(authMiddleware.RequireAuth())
+ 	{
+-		v1.GET("/overview", h.getOverview)
+-		v1.GET("/applications", h.listApplications)
+-		v1.POST("/applications", h.createApplication)
+-		v1.GET("/pipelines", h.listPipelines)
+-		v1.POST("/pipelines/run", h.runPipeline)
+-		v1.GET("/deployments", h.listDeployments)
+-		v1.POST("/deployments", h.createDeployment)
+-		v1.GET("/security/alerts", h.listSecurityAlerts)
+-		v1.POST("/security/scans", h.runSecurityScan)
+-		v1.PATCH("/security/alerts/:id/status", h.updateSecurityAlertStatus)
+-		v1.GET("/observability/signals", h.listObservabilitySignals)
+-		v1.GET("/integrations", h.listIntegrations)
+-		v1.POST("/integrations", h.createIntegration)
+-		v1.GET("/integrations/:id", h.getIntegration)
+-		v1.PUT("/integrations/:id", h.updateIntegration)
+-		v1.DELETE("/integrations/:id", h.deleteIntegration)
+-		v1.PATCH("/integrations/:id/enabled", h.setIntegrationEnabled)
+-		v1.POST("/integrations/:id/test", h.testIntegration)
+-		v1.POST("/integrations/:id/sync", h.syncIntegration)
+-		v1.GET("/integrations/:id/logs", h.listIntegrationLogs)
+-		v1.GET("/registry/artifacts", h.listRegistryArtifacts)
++		v1.GET("/platform/config", authMiddleware.RequirePermission("platform:read"), h.platformConfig)
++		v1.GET("/platform/health", authMiddleware.RequirePermission("platform:read"), h.readiness)
++		v1.GET("/platform/readiness", authMiddleware.RequirePermission("platform:read"), h.readiness)
++		v1.GET("/platform/liveness", authMiddleware.RequirePermission("platform:read"), h.liveness)
++
++		v1.GET("/overview", authMiddleware.RequirePermission("platform:read"), h.getOverview)
++		v1.GET("/applications", authMiddleware.RequirePermission("application:read"), h.listApplications)
++		v1.POST("/applications", authMiddleware.RequirePermission("application:write"), h.createApplication)
++		v1.GET("/pipelines", authMiddleware.RequirePermission("application:read"), h.listPipelines)
++		v1.POST("/pipelines/run", authMiddleware.RequirePermission("pipeline:operate"), h.runPipeline)
++		v1.GET("/deployments", authMiddleware.RequirePermission("application:read"), h.listDeployments)
++		v1.POST("/deployments", authMiddleware.RequirePermission("deployment:operate"), h.createDeployment)
++		v1.GET("/security/alerts", authMiddleware.RequirePermission("application:read"), h.listSecurityAlerts)
++		v1.POST("/security/scans", authMiddleware.RequirePermission("security:operate"), h.runSecurityScan)
++		v1.PATCH("/security/alerts/:id/status", authMiddleware.RequirePermission("security:operate"), h.updateSecurityAlertStatus)
++		v1.GET("/observability/signals", authMiddleware.RequirePermission("platform:read"), h.listObservabilitySignals)
++		v1.GET("/registry/artifacts", authMiddleware.RequirePermission("platform:read"), h.listRegistryArtifacts)
++
++		v1.GET("/settings", authMiddleware.RequirePermission("settings:read"), h.listSettings)
++		v1.PUT("/settings/:key", authMiddleware.RequirePermission("settings:write"), h.upsertSetting)
++
++		v1.GET("/integration-types", authMiddleware.RequirePermission("integration:read"), h.integrationTypes)
++		v1.GET("/integrations", authMiddleware.RequirePermission("integration:read"), h.listIntegrations)
++		v1.POST("/integrations", authMiddleware.RequirePermission("integration:write"), h.createIntegration)
++		v1.GET("/integrations/:id", authMiddleware.RequirePermission("integration:read"), h.getIntegration)
++		v1.PUT("/integrations/:id", authMiddleware.RequirePermission("integration:write"), h.updateIntegration)
++		v1.DELETE("/integrations/:id", authMiddleware.RequirePermission("integration:delete"), h.deleteIntegration)
++		v1.PATCH("/integrations/:id/enabled", authMiddleware.RequirePermission("integration:operate"), h.setIntegrationEnabled)
++		v1.POST("/integrations/:id/test", authMiddleware.RequirePermission("integration:operate"), h.testIntegration)
++		v1.POST("/integrations/:id/sync", authMiddleware.RequirePermission("integration:operate"), h.syncIntegration)
++		v1.GET("/integrations/:id/status", authMiddleware.RequirePermission("integration:read"), h.getIntegrationStatus)
++		v1.GET("/integrations/:id/logs", authMiddleware.RequirePermission("integration:read"), h.listIntegrationLogs)
++		v1.GET("/integrations/:id/connection-history", authMiddleware.RequirePermission("integration:read"), h.listConnectionHistory)
+ 	}
+ 
+ 	return router
+@@ -70,6 +95,36 @@ func (h *Handler) health(c *gin.Context) {
+ 	c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "sentinelops-api"})
+ }
+ 
++func (h *Handler) liveness(c *gin.Context) {
++	c.JSON(http.StatusOK, gin.H{"status": "alive", "checkedAt": time.Now().UTC()})
++}
++
++func (h *Handler) readiness(c *gin.Context) {
++	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
++	defer cancel()
++	checks := gin.H{"api": "ok"}
++	ready := true
++	if h.redis != nil {
++		if err := h.redis.Ping(ctx).Err(); err != nil {
++			checks["redis"] = err.Error()
++			ready = false
++		} else {
++			checks["redis"] = "ok"
++		}
++	}
++	status := http.StatusOK
++	state := "ready"
++	if !ready {
++		status = http.StatusServiceUnavailable
++		state = "degraded"
++	}
++	c.JSON(status, gin.H{"status": state, "checks": checks, "checkedAt": time.Now().UTC()})
++}
++
++func (h *Handler) platformConfig(c *gin.Context) {
++	c.JSON(http.StatusOK, h.cfg.PublicRuntimeConfig())
++}
++
+ func (h *Handler) getOverview(c *gin.Context) {
+ 	data, err := h.overview.GetOverview(c.Request.Context())
+ 	respond(c, data, err)
+@@ -82,8 +137,7 @@ func (h *Handler) listApplications(c *gin.Context) {
+ 
+ func (h *Handler) createApplication(c *gin.Context) {
+ 	var req domain.CreateApplicationRequest
+-	if err := c.ShouldBindJSON(&req); err != nil {
+-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++	if !bindJSON(c, &req) {
+ 		return
+ 	}
+ 	data, err := h.modules.CreateApplication(c.Request.Context(), req)
+@@ -98,8 +152,7 @@ func (h *Handler) listPipelines(c *gin.Context) {
+ 
+ func (h *Handler) runPipeline(c *gin.Context) {
+ 	var req domain.CreatePipelineRunRequest
+-	if err := c.ShouldBindJSON(&req); err != nil {
+-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++	if !bindJSON(c, &req) {
+ 		return
+ 	}
+ 	data, err := h.modules.RunPipeline(c.Request.Context(), req)
+@@ -114,8 +167,7 @@ func (h *Handler) listDeployments(c *gin.Context) {
+ 
+ func (h *Handler) createDeployment(c *gin.Context) {
+ 	var req domain.CreateDeploymentRequest
+-	if err := c.ShouldBindJSON(&req); err != nil {
+-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++	if !bindJSON(c, &req) {
+ 		return
+ 	}
+ 	data, err := h.modules.CreateDeployment(c.Request.Context(), req)
+@@ -130,8 +182,7 @@ func (h *Handler) listSecurityAlerts(c *gin.Context) {
+ 
+ func (h *Handler) runSecurityScan(c *gin.Context) {
+ 	var req domain.CreateSecurityScanRequest
+-	if err := c.ShouldBindJSON(&req); err != nil {
+-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++	if !bindJSON(c, &req) {
+ 		return
+ 	}
+ 	data, err := h.modules.RunSecurityScan(c.Request.Context(), req)
+@@ -141,8 +192,7 @@ func (h *Handler) runSecurityScan(c *gin.Context) {
+ 
+ func (h *Handler) updateSecurityAlertStatus(c *gin.Context) {
+ 	var req domain.UpdateAlertStatusRequest
+-	if err := c.ShouldBindJSON(&req); err != nil {
+-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++	if !bindJSON(c, &req) {
+ 		return
+ 	}
+ 	data, err := h.modules.UpdateSecurityAlertStatus(c.Request.Context(), c.Param("id"), req)
+@@ -155,6 +205,29 @@ func (h *Handler) listObservabilitySignals(c *gin.Context) {
+ 	respond(c, data, err)
+ }
+ 
++func (h *Handler) listRegistryArtifacts(c *gin.Context) {
++	data, err := h.modules.ListRegistryArtifacts(c.Request.Context())
++	respond(c, data, err)
++}
++
++func (h *Handler) listSettings(c *gin.Context) {
++	data, err := h.modules.ListSettings(c.Request.Context())
++	respond(c, data, err)
++}
++
++func (h *Handler) upsertSetting(c *gin.Context) {
++	var req domain.UpdateSettingRequest
++	if !bindJSON(c, &req) {
++		return
++	}
++	data, err := h.modules.UpsertSetting(c.Request.Context(), c.Param("key"), req)
++	respond(c, data, err)
++}
++
++func (h *Handler) integrationTypes(c *gin.Context) {
++	respond(c, h.integrations.Types(c.Request.Context()), nil)
++}
++
+ func (h *Handler) listIntegrations(c *gin.Context) {
+ 	data, err := h.integrations.List(c.Request.Context())
+ 	respond(c, data, err)
+@@ -167,8 +240,7 @@ func (h *Handler) getIntegration(c *gin.Context) {
+ 
+ func (h *Handler) createIntegration(c *gin.Context) {
+ 	var req domain.CreateIntegrationRequest
+-	if err := c.ShouldBindJSON(&req); err != nil {
+-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++	if !bindJSON(c, &req) {
+ 		return
+ 	}
+ 	data, err := h.integrations.Create(c.Request.Context(), req)
+@@ -178,8 +250,7 @@ func (h *Handler) createIntegration(c *gin.Context) {
+ 
+ func (h *Handler) updateIntegration(c *gin.Context) {
+ 	var req domain.UpdateIntegrationRequest
+-	if err := c.ShouldBindJSON(&req); err != nil {
+-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++	if !bindJSON(c, &req) {
+ 		return
+ 	}
+ 	data, err := h.integrations.Update(c.Request.Context(), c.Param("id"), req)
+@@ -189,7 +260,7 @@ func (h *Handler) updateIntegration(c *gin.Context) {
+ 
+ func (h *Handler) deleteIntegration(c *gin.Context) {
+ 	if err := h.integrations.Delete(c.Request.Context(), c.Param("id")); err != nil {
+-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
++		respond(c, nil, err)
+ 		return
+ 	}
+ 	h.overview.Invalidate(c.Request.Context())
+@@ -198,8 +269,7 @@ func (h *Handler) deleteIntegration(c *gin.Context) {
+ 
+ func (h *Handler) setIntegrationEnabled(c *gin.Context) {
+ 	var req domain.SetIntegrationEnabledRequest
+-	if err := c.ShouldBindJSON(&req); err != nil {
+-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++	if !bindJSON(c, &req) {
+ 		return
+ 	}
+ 	data, err := h.integrations.SetEnabled(c.Request.Context(), c.Param("id"), req)
+@@ -219,23 +289,40 @@ func (h *Handler) syncIntegration(c *gin.Context) {
+ 	respond(c, data, err)
+ }
+ 
++func (h *Handler) getIntegrationStatus(c *gin.Context) {
++	data, err := h.integrations.Status(c.Request.Context(), c.Param("id"))
++	respond(c, data, err)
++}
++
+ func (h *Handler) listIntegrationLogs(c *gin.Context) {
+ 	data, err := h.integrations.Logs(c.Request.Context(), c.Param("id"))
+ 	respond(c, data, err)
+ }
+ 
+-func (h *Handler) listRegistryArtifacts(c *gin.Context) {
+-	data, err := h.modules.ListRegistryArtifacts(c.Request.Context())
++func (h *Handler) listConnectionHistory(c *gin.Context) {
++	data, err := h.integrations.ConnectionHistory(c.Request.Context(), c.Param("id"))
+ 	respond(c, data, err)
+ }
+ 
++func bindJSON(c *gin.Context, req any) bool {
++	if err := c.ShouldBindJSON(req); err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "requestId": c.Writer.Header().Get("X-Request-ID")})
++		return false
++	}
++	return true
++}
++
+ func respond(c *gin.Context, data any, err error) {
+ 	respondWithStatus(c, http.StatusOK, data, err)
+ }
+ 
+ func respondWithStatus(c *gin.Context, status int, data any, err error) {
+ 	if err != nil {
+-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
++		statusCode := http.StatusInternalServerError
++		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
++			statusCode = http.StatusGatewayTimeout
++		}
++		c.JSON(statusCode, gin.H{"error": err.Error(), "requestId": c.Writer.Header().Get("X-Request-ID")})
+ 		return
+ 	}
+ 	c.JSON(status, data)
+diff --git a/apps/api/internal/platform/integrations/adapters.go b/apps/api/internal/platform/integrations/adapters.go
+index c7ef035..c29fea6 100644
+--- a/apps/api/internal/platform/integrations/adapters.go
++++ b/apps/api/internal/platform/integrations/adapters.go
+@@ -5,105 +5,55 @@ import (
+ 	"crypto/tls"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
+ 	"strings"
+ 	"time"
+ 
+ 	"github.com/sentinelops/sentinelops/apps/api/internal/domain"
++	"github.com/sentinelops/sentinelops/apps/api/internal/platform/retry"
+ 	"github.com/sentinelops/sentinelops/apps/api/internal/ports"
+ )
+ 
++type RegistryOptions struct {
++	Mode    string
++	Timeout time.Duration
++	Retries int
++}
++
+ type Registry struct {
+-	mode string
++	mode    string
++	timeout time.Duration
++	retries int
+ }
+ 
+-func NewRegistry(mode string) *Registry {
+-	mode = strings.ToLower(strings.TrimSpace(mode))
++func NewRegistry(options RegistryOptions) *Registry {
++	mode := strings.ToLower(strings.TrimSpace(options.Mode))
+ 	if mode == "" {
+ 		mode = domain.IntegrationModeDemo
+ 	}
+-	return &Registry{mode: mode}
+-}
+-
+-func (r *Registry) For(ctx context.Context, cfg domain.IntegrationConfig) ports.Integration {
+-	if r.mode == domain.IntegrationModeDemo || cfg.Mode == domain.IntegrationModeDemo {
+-		return SimulatorAdapter{}
+-	}
+-	return HTTPAdapter{client: httpClient(cfg.TLSVerify)}
+-}
+-
+-type SimulatorAdapter struct{}
+-
+-func (SimulatorAdapter) Connect(ctx context.Context, cfg domain.IntegrationConfig) error {
+-	if !cfg.Enabled {
+-		return fmt.Errorf("integration is disabled")
+-	}
+-	return nil
+-}
+-
+-func (SimulatorAdapter) Health(ctx context.Context, cfg domain.IntegrationConfig) (domain.IntegrationHealth, error) {
+-	if !cfg.Enabled {
+-		return domain.IntegrationHealth{
+-			Status:    domain.IntegrationStatusDisabled,
+-			Healthy:   false,
+-			Message:   "integration is disabled",
+-			CheckedAt: time.Now().UTC(),
+-		}, nil
++	timeout := options.Timeout
++	if timeout <= 0 {
++		timeout = 8 * time.Second
+ 	}
+-	return domain.IntegrationHealth{
+-		Status:    domain.IntegrationStatusConnected,
+-		Healthy:   true,
+-		Message:   fmt.Sprintf("%s simulator adapter is reachable in demo mode", cfg.Type),
+-		CheckedAt: time.Now().UTC(),
+-		Attributes: map[string]string{
+-			"mode":      domain.IntegrationModeDemo,
+-			"namespace": cfg.Namespace,
+-		},
+-	}, nil
+-}
+-
+-func (SimulatorAdapter) Sync(ctx context.Context, cfg domain.IntegrationConfig) (domain.IntegrationSyncResult, error) {
+-	if !cfg.Enabled {
+-		return domain.IntegrationSyncResult{
+-			Status:   domain.IntegrationStatusDisabled,
+-			Message:  "integration is disabled",
+-			SyncedAt: time.Now().UTC(),
+-		}, nil
++	retries := options.Retries
++	if retries < 0 {
++		retries = 0
+ 	}
+-	return domain.IntegrationSyncResult{
+-		Status:   domain.IntegrationStatusConnected,
+-		Message:  fmt.Sprintf("%s simulator sync completed", cfg.Type),
+-		SyncedAt: time.Now().UTC(),
+-		Resources: map[string]int{
+-			"metrics":  3,
+-			"events":   1,
+-			"findings": 0,
+-		},
+-		Metadata: map[string]string{
+-			"adapter": "simulator",
+-			"mode":    domain.IntegrationModeDemo,
+-		},
+-	}, nil
++	return &Registry{mode: mode, timeout: timeout, retries: retries}
+ }
+ 
+-func (SimulatorAdapter) Status(ctx context.Context, cfg domain.IntegrationConfig) (string, error) {
+-	if !cfg.Enabled {
+-		return domain.IntegrationStatusDisabled, nil
++func (r *Registry) For(ctx context.Context, cfg domain.IntegrationConfig) ports.Integration {
++	return HTTPAdapter{
++		client:  httpClient(cfg.TLSVerify, r.timeout),
++		retries: r.retries,
+ 	}
+-	return domain.IntegrationStatusConnected, nil
+-}
+-
+-func (SimulatorAdapter) Configuration(ctx context.Context, cfg domain.IntegrationConfig) (map[string]string, error) {
+-	return map[string]string{
+-		"endpointUrl": cfg.EndpointURL,
+-		"namespace":   cfg.Namespace,
+-		"tlsVerify":   fmt.Sprintf("%t", cfg.TLSVerify),
+-		"mode":        domain.IntegrationModeDemo,
+-	}, nil
+ }
+ 
+ type HTTPAdapter struct {
+-	client *http.Client
++	client  *http.Client
++	retries int
+ }
+ 
+ func (a HTTPAdapter) Connect(ctx context.Context, cfg domain.IntegrationConfig) error {
+@@ -118,51 +68,96 @@ func (a HTTPAdapter) Connect(ctx context.Context, cfg domain.IntegrationConfig)
+ }
+ 
+ func (a HTTPAdapter) Health(ctx context.Context, cfg domain.IntegrationConfig) (domain.IntegrationHealth, error) {
++	started := time.Now().UTC()
+ 	if !cfg.Enabled {
+ 		return domain.IntegrationHealth{
+ 			Status:    domain.IntegrationStatusDisabled,
+ 			Healthy:   false,
+ 			Message:   "integration is disabled",
+-			CheckedAt: time.Now().UTC(),
++			CheckedAt: started,
++			LatencyMs: 0,
++			Attributes: map[string]string{
++				"adapter": "http",
++				"mode":    cfg.Mode,
++			},
+ 		}, nil
+ 	}
+ 
+-	url := healthURL(cfg)
+-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
++	endpoint, err := validatedHealthURL(cfg)
+ 	if err != nil {
+-		return domain.IntegrationHealth{}, err
+-	}
+-	if cfg.AccessToken != "" {
+-		req.Header.Set("Authorization", "Bearer "+cfg.AccessToken)
+-	}
+-	if cfg.Username != "" && cfg.Password != "" {
+-		req.SetBasicAuth(cfg.Username, cfg.Password)
++		return domain.IntegrationHealth{
++			Status:    domain.IntegrationStatusError,
++			Healthy:   false,
++			Message:   err.Error(),
++			CheckedAt: started,
++			LatencyMs: int(time.Since(started).Milliseconds()),
++			Attributes: map[string]string{
++				"adapter": "http",
++			},
++		}, nil
+ 	}
+ 
+-	resp, err := a.client.Do(req)
++	var responseStatus int
++	var responseBody string
++	var lastErr error
++	policy := retry.Policy{Attempts: a.retries + 1, Backoff: 250 * time.Millisecond}
++	err = policy.Do(ctx, func() error {
++		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
++		if err != nil {
++			return err
++		}
++		applyAuth(req, cfg)
++		resp, err := a.client.Do(req)
++		if err != nil {
++			lastErr = err
++			return err
++		}
++		defer resp.Body.Close()
++		responseStatus = resp.StatusCode
++		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
++		responseBody = strings.TrimSpace(string(body))
++		if resp.StatusCode >= 500 {
++			lastErr = fmt.Errorf("remote service returned HTTP %d", resp.StatusCode)
++			return lastErr
++		}
++		return nil
++	})
++
++	latency := int(time.Since(started).Milliseconds())
+ 	if err != nil {
+ 		return domain.IntegrationHealth{
+ 			Status:    domain.IntegrationStatusDisconnected,
+ 			Healthy:   false,
+-			Message:   err.Error(),
+-			CheckedAt: time.Now().UTC(),
++			Message:   lastErrOr(err, lastErr),
++			CheckedAt: started,
++			LatencyMs: latency,
++			Attributes: map[string]string{
++				"adapter": "http",
++				"url":     endpoint,
++			},
+ 		}, nil
+ 	}
+-	defer resp.Body.Close()
+ 
+-	healthy := resp.StatusCode >= 200 && resp.StatusCode < 400
++	healthy := responseStatus >= 200 && responseStatus < 400
+ 	status := domain.IntegrationStatusConnected
+ 	if !healthy {
+ 		status = domain.IntegrationStatusError
+ 	}
++	message := fmt.Sprintf("%s responded with HTTP %d", endpoint, responseStatus)
++	if !healthy && responseBody != "" {
++		message = fmt.Sprintf("%s; body: %.180s", message, responseBody)
++	}
+ 	return domain.IntegrationHealth{
+ 		Status:    status,
+ 		Healthy:   healthy,
+-		Message:   fmt.Sprintf("%s responded with HTTP %d", url, resp.StatusCode),
+-		CheckedAt: time.Now().UTC(),
++		Message:   message,
++		CheckedAt: started,
++		LatencyMs: latency,
+ 		Attributes: map[string]string{
+-			"statusCode": fmt.Sprintf("%d", resp.StatusCode),
++			"statusCode": fmt.Sprintf("%d", responseStatus),
+ 			"adapter":    "http",
++			"url":        endpoint,
++			"mode":       cfg.Mode,
+ 		},
+ 	}, nil
+ }
+@@ -174,7 +169,7 @@ func (a HTTPAdapter) Sync(ctx context.Context, cfg domain.IntegrationConfig) (do
+ 	}
+ 	return domain.IntegrationSyncResult{
+ 		Status:   health.Status,
+-		Message:  "health data synchronized from integration endpoint",
++		Message:  "integration status synchronized from health endpoint",
+ 		SyncedAt: time.Now().UTC(),
+ 		Resources: map[string]int{
+ 			"health_checks": 1,
+@@ -192,43 +187,83 @@ func (a HTTPAdapter) Status(ctx context.Context, cfg domain.IntegrationConfig) (
+ }
+ 
+ func (a HTTPAdapter) Configuration(ctx context.Context, cfg domain.IntegrationConfig) (map[string]string, error) {
++	endpoint, err := validatedHealthURL(cfg)
++	if err != nil {
++		return nil, err
++	}
+ 	return map[string]string{
+ 		"endpointUrl": cfg.EndpointURL,
++		"healthUrl":   endpoint,
+ 		"namespace":   cfg.Namespace,
+ 		"tlsVerify":   fmt.Sprintf("%t", cfg.TLSVerify),
+ 		"adapter":     "http",
++		"mode":        cfg.Mode,
+ 	}, nil
+ }
+ 
+-func httpClient(tlsVerify bool) *http.Client {
++func httpClient(tlsVerify bool, timeout time.Duration) *http.Client {
+ 	transport := &http.Transport{
+-		TLSClientConfig: &tls.Config{InsecureSkipVerify: !tlsVerify}, //nolint:gosec -- user-controlled lab setting.
++		TLSClientConfig: &tls.Config{InsecureSkipVerify: !tlsVerify}, //nolint:gosec -- explicit integration setting stored per integration.
++	}
++	return &http.Client{Timeout: timeout, Transport: transport}
++}
++
++func applyAuth(req *http.Request, cfg domain.IntegrationConfig) {
++	if cfg.AccessToken != "" {
++		req.Header.Set("Authorization", "Bearer "+cfg.AccessToken)
++	}
++	if cfg.Username != "" && cfg.Password != "" {
++		req.SetBasicAuth(cfg.Username, cfg.Password)
+ 	}
+-	return &http.Client{Timeout: 8 * time.Second, Transport: transport}
+ }
+ 
+-func healthURL(cfg domain.IntegrationConfig) string {
+-	base := strings.TrimRight(cfg.EndpointURL, "/")
+-	switch cfg.Type {
++func validatedHealthURL(cfg domain.IntegrationConfig) (string, error) {
++	base := strings.TrimRight(strings.TrimSpace(cfg.EndpointURL), "/")
++	if base == "" {
++		return "", errors.New("endpoint URL is required")
++	}
++	parsed, err := url.Parse(base)
++	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
++		return "", fmt.Errorf("endpoint URL is invalid")
++	}
++	path := healthPath(cfg.Type)
++	if path == "" {
++		return base, nil
++	}
++	return base + path, nil
++}
++
++func healthPath(toolType string) string {
++	switch toolType {
+ 	case "Prometheus":
+-		return base + "/-/healthy"
++		return "/-/healthy"
+ 	case "Grafana":
+-		return base + "/api/health"
++		return "/api/health"
+ 	case "Harbor":
+-		return base + "/api/v2.0/health"
++		return "/api/v2.0/health"
+ 	case "ArgoCD":
+-		return base + "/api/version"
++		return "/api/version"
+ 	case "Loki":
+-		return base + "/ready"
++		return "/ready"
+ 	case "Tempo":
+-		return base + "/ready"
++		return "/ready"
+ 	case "Vault":
+-		return base + "/v1/sys/health"
++		return "/v1/sys/health"
+ 	case "SonarQube":
+-		return base + "/api/system/health"
++		return "/api/system/health"
+ 	case "Keycloak":
+-		return base + "/realms/master"
++		return "/realms/master"
+ 	default:
+-		return base
++		return ""
++	}
++}
++
++func lastErrOr(primary error, secondary error) string {
++	if secondary != nil {
++		return secondary.Error()
++	}
++	if primary != nil {
++		return primary.Error()
+ 	}
++	return "connection failed"
+ }
+diff --git a/apps/api/internal/platform/integrations/adapters_test.go b/apps/api/internal/platform/integrations/adapters_test.go
+new file mode 100644
+index 0000000..c9acfa0
+--- /dev/null
++++ b/apps/api/internal/platform/integrations/adapters_test.go
+@@ -0,0 +1,20 @@
++package integrations
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/sentinelops/sentinelops/apps/api/internal/domain"
++)
++
++func TestHTTPAdapterDisabledIntegrationDoesNotFakeSuccess(t *testing.T) {
++	adapter := HTTPAdapter{client: httpClient(true, time.Second), retries: 0}
++	health, err := adapter.Health(context.Background(), domain.IntegrationConfig{Enabled: false, Type: "Prometheus"})
++	if err != nil {
++		t.Fatalf("health returned error: %v", err)
++	}
++	if health.Healthy || health.Status != domain.IntegrationStatusDisabled {
++		t.Fatalf("expected disabled health, got healthy=%v status=%s", health.Healthy, health.Status)
++	}
++}
+diff --git a/apps/api/internal/platform/logging/logger.go b/apps/api/internal/platform/logging/logger.go
+new file mode 100644
+index 0000000..75bef65
+--- /dev/null
++++ b/apps/api/internal/platform/logging/logger.go
+@@ -0,0 +1,66 @@
++package logging
++
++import (
++	"context"
++	"io"
++	"log/slog"
++	"os"
++	"time"
++)
++
++type ctxKey string
++
++const (
++	RequestIDKey ctxKey = "request_id"
++	ActorKey     ctxKey = "actor"
++)
++
++func New(format string, output io.Writer) *slog.Logger {
++	if output == nil {
++		output = os.Stdout
++	}
++	var handler slog.Handler
++	if format == "json" {
++		handler = slog.NewJSONHandler(output, &slog.HandlerOptions{Level: slog.LevelInfo})
++	} else {
++		handler = slog.NewTextHandler(output, &slog.HandlerOptions{Level: slog.LevelInfo})
++	}
++	return slog.New(handler)
++}
++
++func WithRequestID(ctx context.Context, requestID string) context.Context {
++	return context.WithValue(ctx, RequestIDKey, requestID)
++}
++
++func RequestID(ctx context.Context) string {
++	if value, ok := ctx.Value(RequestIDKey).(string); ok {
++		return value
++	}
++	return ""
++}
++
++func WithActor(ctx context.Context, actor string) context.Context {
++	return context.WithValue(ctx, ActorKey, actor)
++}
++
++func Actor(ctx context.Context) string {
++	if value, ok := ctx.Value(ActorKey).(string); ok {
++		return value
++	}
++	return "system"
++}
++
++func Attrs(ctx context.Context) []slog.Attr {
++	attrs := []slog.Attr{}
++	if requestID := RequestID(ctx); requestID != "" {
++		attrs = append(attrs, slog.String("request_id", requestID))
++	}
++	if actor := Actor(ctx); actor != "" {
++		attrs = append(attrs, slog.String("actor", actor))
++	}
++	return attrs
++}
++
++func Since(start time.Time) slog.Attr {
++	return slog.Int64("duration_ms", time.Since(start).Milliseconds())
++}
+diff --git a/apps/api/internal/platform/retry/retry.go b/apps/api/internal/platform/retry/retry.go
+new file mode 100644
+index 0000000..a593be7
+--- /dev/null
++++ b/apps/api/internal/platform/retry/retry.go
+@@ -0,0 +1,39 @@
++package retry
++
++import (
++	"context"
++	"time"
++)
++
++type Policy struct {
++	Attempts int
++	Backoff  time.Duration
++}
++
++func (p Policy) Do(ctx context.Context, fn func() error) error {
++	attempts := p.Attempts
++	if attempts < 1 {
++		attempts = 1
++	}
++	backoff := p.Backoff
++	if backoff <= 0 {
++		backoff = 200 * time.Millisecond
++	}
++	var lastErr error
++	for attempt := 1; attempt <= attempts; attempt++ {
++		if err := fn(); err != nil {
++			lastErr = err
++			if attempt == attempts {
++				break
++			}
++			select {
++			case <-ctx.Done():
++				return ctx.Err()
++			case <-time.After(backoff * time.Duration(attempt)):
++			}
++			continue
++		}
++		return nil
++	}
++	return lastErr
++}
+diff --git a/apps/web/app/settings/page.tsx b/apps/web/app/settings/page.tsx
+index a439a61..61b34f4 100644
+--- a/apps/web/app/settings/page.tsx
++++ b/apps/web/app/settings/page.tsx
+@@ -3,7 +3,7 @@
+ import { useMemo, useState } from 'react';
+ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+ import { api, type IntegrationPayload } from '@/lib/api';
+-import type { Integration, IntegrationLog } from '@/lib/types';
++import type { ConnectionHistory, Integration, IntegrationLog, IntegrationType } from '@/lib/types';
+ import { StatusDot } from '@/components/dashboard/status-dot';
+ import { ErrorState } from '@/components/dashboard/error-state';
+ import { LoadingState } from '@/components/dashboard/loading-state';
+@@ -11,32 +11,11 @@ import { Badge } from '@/components/ui/badge';
+ import { Button } from '@/components/ui/button';
+ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+ 
+-const toolTypes = [
+-  'Prometheus',
+-  'Grafana',
+-  'Harbor',
+-  'Vault',
+-  'GitHub',
+-  'GitHubActions',
+-  'ArgoCD',
+-  'Kubernetes',
+-  'Loki',
+-  'Tempo',
+-  'SonarQube',
+-  'Trivy',
+-  'Semgrep',
+-  'Gitleaks',
+-  'Falco',
+-  'Wazuh',
+-  'Keycloak',
+-  'OPA-Gatekeeper'
+-];
+-
+ const emptyForm: IntegrationPayload = {
+   name: '',
+   type: 'Prometheus',
+   category: '',
+-  endpointUrl: 'http://localhost:9090',
++  endpointUrl: '',
+   accessToken: '',
+   username: '',
+   password: '',
+@@ -76,17 +55,24 @@ export default function SettingsPage() {
+   const [feedback, setFeedback] = useState<string>('');
+ 
+   const integrations = useQuery({ queryKey: ['integrations'], queryFn: api.integrations });
++  const integrationTypes = useQuery({ queryKey: ['integration-types'], queryFn: api.integrationTypes });
+   const logs = useQuery({
+     queryKey: ['integration-logs', selected?.id],
+     queryFn: () => api.integrationLogs(selected!.id),
+     enabled: Boolean(selected?.id)
+   });
++  const history = useQuery({
++    queryKey: ['connection-history', selected?.id],
++    queryFn: () => api.connectionHistory(selected!.id),
++    enabled: Boolean(selected?.id)
++  });
+ 
+   const invalidate = async () => {
+     await Promise.all([
+       queryClient.invalidateQueries({ queryKey: ['integrations'] }),
+       queryClient.invalidateQueries({ queryKey: ['overview'] }),
+-      queryClient.invalidateQueries({ queryKey: ['integration-logs'] })
++      queryClient.invalidateQueries({ queryKey: ['integration-logs'] }),
++      queryClient.invalidateQueries({ queryKey: ['connection-history'] })
+     ]);
+   };
+ 
+@@ -155,9 +141,10 @@ export default function SettingsPage() {
+   const isBusy = createMutation.isPending || updateMutation.isPending || deleteMutation.isPending || enableMutation.isPending || testMutation.isPending || syncMutation.isPending;
+ 
+   const integrationList = useMemo(() => integrations.data ?? [], [integrations.data]);
++  const typeList = useMemo(() => integrationTypes.data ?? [], [integrationTypes.data]);
+ 
+-  if (integrations.isLoading) return <LoadingState label="Loading platform settings..." />;
+-  if (integrations.error) return <ErrorState message="Unable to load integrations from the SentinelOps API." />;
++  if (integrations.isLoading || integrationTypes.isLoading) return <LoadingState label="Loading platform settings..." />;
++  if (integrations.error || integrationTypes.error) return <ErrorState message="Unable to load integration settings from the SentinelOps API." />;
+ 
+   const submit = () => {
+     setFeedback('');
+@@ -183,7 +170,7 @@ export default function SettingsPage() {
+ 
+   const resetForm = () => {
+     setSelected(null);
+-    setForm(emptyForm);
++    setForm({ ...emptyForm, type: typeList[0]?.type ?? emptyForm.type, category: typeList[0]?.category ?? '' });
+     setFeedback('');
+   };
+ 
+@@ -236,13 +223,16 @@ export default function SettingsPage() {
+               <select
+                 className="mt-1 w-full rounded-xl border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-cyan-400/50"
+                 value={form.type}
+-                onChange={(event) => setForm({ ...form, type: event.target.value })}
++                onChange={(event) => {
++                  const selectedType = typeList.find((tool: IntegrationType) => tool.type === event.target.value);
++                  setForm({ ...form, type: event.target.value, category: selectedType?.category ?? form.category });
++                }}
+               >
+-                {toolTypes.map((tool) => <option key={tool} value={tool}>{tool}</option>)}
++                {typeList.map((tool: IntegrationType) => <option key={tool.type} value={tool.type}>{tool.type} — {tool.category}</option>)}
+               </select>
+             </label>
+             <Field label="Category" value={form.category ?? ''} onChange={(value) => setForm({ ...form, category: value })} placeholder="Observability" />
+-            <Field label="Endpoint URL" value={form.endpointUrl} onChange={(value) => setForm({ ...form, endpointUrl: value })} placeholder="http://prometheus:9090" />
++            <Field label="Endpoint URL" value={form.endpointUrl} onChange={(value) => setForm({ ...form, endpointUrl: value })} placeholder="https://integration.internal" />
+             <Field label="Access Token" value={form.accessToken ?? ''} onChange={(value) => setForm({ ...form, accessToken: value })} placeholder={selected?.hasAccessToken ? 'leave empty to keep encrypted token' : 'optional'} type="password" />
+             <div className="grid gap-3 md:grid-cols-2">
+               <Field label="Username" value={form.username ?? ''} onChange={(value) => setForm({ ...form, username: value })} placeholder="optional" />
+@@ -296,6 +286,16 @@ export default function SettingsPage() {
+               <CardTitle>Integration Logs</CardTitle>
+             </CardHeader>
+             <CardContent className="space-y-3">
++              {(history.data ?? []).slice(0, 3).map((item: ConnectionHistory) => (
++                <div key={item.id} className="rounded-xl border border-slate-800 bg-slate-950/70 p-3">
++                  <div className="mb-1 flex items-center justify-between gap-3">
++                    <div className="flex items-center gap-2 text-sm font-medium text-slate-200"><StatusDot status={item.status} />{item.action}</div>
++                    <Badge variant={badgeVariant(item.status)}>{item.latencyMs} ms</Badge>
++                  </div>
++                  <div className="text-xs text-slate-500">{item.message}</div>
++                  <div className="mt-1 text-[11px] text-slate-600">{new Date(item.checkedAt).toLocaleString()}</div>
++                </div>
++              ))}
+               {(logs.data ?? []).map((log: IntegrationLog) => (
+                 <div key={log.id} className="rounded-xl border border-slate-800 bg-slate-900/70 p-3">
+                   <div className="mb-1 flex items-center justify-between gap-3">
+@@ -306,7 +306,7 @@ export default function SettingsPage() {
+                   <div className="mt-1 text-[11px] text-slate-600">{new Date(log.createdAt).toLocaleString()}</div>
+                 </div>
+               ))}
+-              {!logs.data?.length ? <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 text-sm text-slate-500">No logs yet. Run a test connection or sync.</div> : null}
++              {!logs.data?.length && !history.data?.length ? <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 text-sm text-slate-500">No logs yet. Run a test connection or sync.</div> : null}
+             </CardContent>
+           </Card>
+         </section>
+diff --git a/apps/web/components/layout/header.tsx b/apps/web/components/layout/header.tsx
+index c6feecb..d3ade30 100644
+--- a/apps/web/components/layout/header.tsx
++++ b/apps/web/components/layout/header.tsx
+@@ -1,7 +1,16 @@
+-import { ShieldCheck } from 'lucide-react';
++'use client';
++
++import { useQuery } from '@tanstack/react-query';
++import { ShieldCheck, ShieldAlert } from 'lucide-react';
+ import { Badge } from '@/components/ui/badge';
++import { api } from '@/lib/api';
+ 
+ export function Header() {
++  const health = useQuery({ queryKey: ['platform-health'], queryFn: api.platformHealth });
++  const healthy = health.data?.status === 'ready' || health.data?.status === 'ok';
++  const label = health.isLoading ? 'Checking' : healthy ? 'Healthy' : 'Degraded';
++  const Icon = healthy ? ShieldCheck : ShieldAlert;
++
+   return (
+     <header className="sticky top-0 z-20 border-b border-slate-800/80 bg-slate-950/70 px-6 py-4 backdrop-blur-xl">
+       <div className="flex items-center justify-between">
+@@ -9,8 +18,8 @@ export function Header() {
+           <h1 className="text-xl font-semibold tracking-tight text-slate-50">SentinelOps Dashboard</h1>
+           <p className="text-sm text-slate-500">One dashboard for DevOps, DevSecOps, GitOps, and Observability.</p>
+         </div>
+-        <Badge variant="success" className="gap-2">
+-          <ShieldCheck className="h-3.5 w-3.5" /> Healthy
++        <Badge variant={healthy ? 'success' : health.isLoading ? 'muted' : 'warning'} className="gap-2">
++          <Icon className="h-3.5 w-3.5" /> {label}
+         </Badge>
+       </div>
+     </header>
+diff --git a/apps/web/lib/api.ts b/apps/web/lib/api.ts
+index 7f43279..30dd7b8 100644
+--- a/apps/web/lib/api.ts
++++ b/apps/web/lib/api.ts
+@@ -5,6 +5,10 @@ import type {
+   IntegrationHealth,
+   IntegrationLog,
+   IntegrationSyncResult,
++  IntegrationStatusView,
++  ConnectionHistory,
++  Setting,
++  IntegrationType,
+   ObservabilitySignal,
+   Overview,
+   PipelineRun,
+@@ -12,7 +16,7 @@ import type {
+   SecurityAlert
+ } from './types';
+ 
+-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:8080/api/v1';
++const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? '/api/v1';
+ 
+ async function request<T>(path: string, init?: RequestInit): Promise<T> {
+   const response = await fetch(`${API_BASE_URL}${path}`, {
+@@ -67,6 +71,7 @@ export type IntegrationPayload = {
+ };
+ 
+ export const api = {
++  platformHealth: () => request<{ status: string; checkedAt?: string; checks?: Record<string, string> }>('/platform/health'),
+   overview: () => request<Overview>('/overview'),
+   applications: () => request<Application[]>('/applications'),
+   createApplication: (body: Pick<Application, 'name' | 'owner' | 'repository' | 'environment'>) => post<Application>('/applications', body),
+@@ -78,6 +83,9 @@ export const api = {
+   runSecurityScan: (body: { application: string; source?: string; severity?: string; title?: string }) => post<SecurityAlert>('/security/scans', body),
+   updateAlertStatus: (id: string, status: 'open' | 'triaged' | 'resolved') => patch<SecurityAlert>(`/security/alerts/${id}/status`, { status }),
+   signals: () => request<ObservabilitySignal[]>('/observability/signals'),
++  settings: () => request<Setting[]>('/settings'),
++  updateSetting: (key: string, body: { value: string; environment?: string; isSensitive?: boolean }) => put<Setting>(`/settings/${key}`, body),
++  integrationTypes: () => request<IntegrationType[]>('/integration-types'),
+   integrations: () => request<Integration[]>('/integrations'),
+   createIntegration: (body: IntegrationPayload) => post<Integration>('/integrations', body),
+   updateIntegration: (id: string, body: Partial<IntegrationPayload>) => put<Integration>(`/integrations/${id}`, body),
+@@ -85,6 +93,8 @@ export const api = {
+   setIntegrationEnabled: (id: string, enabled: boolean) => patch<Integration>(`/integrations/${id}/enabled`, { enabled }),
+   testIntegration: (id: string) => post<IntegrationHealth>(`/integrations/${id}/test`),
+   syncIntegration: (id: string) => post<IntegrationSyncResult>(`/integrations/${id}/sync`),
++  integrationStatus: (id: string) => request<IntegrationStatusView>(`/integrations/${id}/status`),
+   integrationLogs: (id: string) => request<IntegrationLog[]>(`/integrations/${id}/logs`),
++  connectionHistory: (id: string) => request<ConnectionHistory[]>(`/integrations/${id}/connection-history`),
+   registryArtifacts: () => request<RegistryArtifact[]>('/registry/artifacts')
+ };
+diff --git a/apps/web/lib/types.ts b/apps/web/lib/types.ts
+index d8ba8e5..d8b4bb2 100644
+--- a/apps/web/lib/types.ts
++++ b/apps/web/lib/types.ts
+@@ -87,6 +87,7 @@ export type IntegrationHealth = {
+   healthy: boolean;
+   message: string;
+   checkedAt: string;
++  latencyMs: number;
+   attributes?: Record<string, string>;
+ };
+ 
+@@ -121,3 +122,37 @@ export type Overview = {
+   recentAlerts: SecurityAlert[];
+   integrations: Integration[];
+ };
++
++
++export type Setting = {
++  key: string;
++  value: string;
++  environment: string;
++  isSensitive: boolean;
++  updatedAt: string;
++};
++
++export type IntegrationStatusView = {
++  id: string;
++  status: string;
++  health: string;
++  lastSyncAt?: string;
++  lastCheckedAt?: string;
++  enabled: boolean;
++};
++
++export type ConnectionHistory = {
++  id: string;
++  integrationId: string;
++  action: string;
++  status: string;
++  message: string;
++  latencyMs: number;
++  checkedAt: string;
++};
++
++export type IntegrationType = {
++  type: string;
++  category: string;
++  description: string;
++};
+diff --git a/docker-compose.yml b/docker-compose.yml
+index ac20559..3536050 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -3,15 +3,15 @@ services:
+     image: postgres:16-alpine
+     container_name: sentinelops-postgres
+     environment:
+-      POSTGRES_DB: ${POSTGRES_DB:-sentinelops}
+-      POSTGRES_USER: ${POSTGRES_USER:-sentinelops}
+-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sentinelops}
++      POSTGRES_DB: ${POSTGRES_DB}
++      POSTGRES_USER: ${POSTGRES_USER}
++      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+     ports:
+       - "5432:5432"
+     volumes:
+       - postgres_data:/var/lib/postgresql/data
+     healthcheck:
+-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sentinelops} -d ${POSTGRES_DB:-sentinelops}"]
++      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+       interval: 5s
+       timeout: 5s
+       retries: 20
+@@ -33,16 +33,22 @@ services:
+       dockerfile: deploy/docker/api.Dockerfile
+     container_name: sentinelops-api
+     environment:
+-      APP_ENV: ${APP_ENV:-local}
+-      API_PORT: ${API_PORT:-8080}
+-      DATABASE_URL: ${DATABASE_URL:-postgres://sentinelops:sentinelops@postgres:5432/sentinelops?sslmode=disable}
+-      REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
+-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+-      AUTH_ENABLED: ${AUTH_ENABLED:-false}
+-      KEYCLOAK_ISSUER_URL: ${KEYCLOAK_ISSUER_URL:-http://keycloak:8080/realms/sentinelops}
+-      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-sentinelops-web}
+-      PLATFORM_MODE: ${PLATFORM_MODE:-demo}
+-      INTEGRATION_ENCRYPTION_KEY: ${INTEGRATION_ENCRYPTION_KEY:-sentinelops-local-dev-key-change-me}
++      APP_ENV: ${APP_ENV}
++      API_PORT: ${API_PORT}
++      DATABASE_URL: ${DATABASE_URL}
++      REDIS_ADDR: ${REDIS_ADDR}
++      REDIS_PASSWORD: ${REDIS_PASSWORD}
++      AUTH_ENABLED: ${AUTH_ENABLED}
++      KEYCLOAK_ISSUER_URL: ${KEYCLOAK_ISSUER_URL}
++      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID}
++      PLATFORM_MODE: ${PLATFORM_MODE}
++      INTEGRATION_ENCRYPTION_KEY: ${INTEGRATION_ENCRYPTION_KEY}
++      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS}
++      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT}
++      INTEGRATION_TIMEOUT: ${INTEGRATION_TIMEOUT}
++      INTEGRATION_RETRIES: ${INTEGRATION_RETRIES}
++      LOG_FORMAT: ${LOG_FORMAT}
++      SENTINELOPS_BOOTSTRAP_TOKEN: ${SENTINELOPS_BOOTSTRAP_TOKEN}
+     ports:
+       - "8080:8080"
+     depends_on:
+@@ -56,10 +62,10 @@ services:
+       context: .
+       dockerfile: deploy/docker/web.Dockerfile
+       args:
+-        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8080/api/v1}
++        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL}
+     container_name: sentinelops-web
+     environment:
+-      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8080/api/v1}
++      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL}
+     ports:
+       - "3000:3000"
+     depends_on:
+diff --git a/docs/api.md b/docs/api.md
+index f8b9905..e2768e1 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -124,7 +124,7 @@ curl -X POST http://localhost:8080/api/v1/integrations \
+ 
+ ### Environment Modes
+ 
+-- `PLATFORM_MODE=demo`: uses simulator adapters; useful for demos and offline classroom environments.
++- `PLATFORM_MODE=demo`: uses real health-check adapters; useful for demos and offline classroom environments.
+ - `PLATFORM_MODE=lab`: uses HTTP adapters against Docker Compose or lab service endpoints.
+ - `PLATFORM_MODE=production`: uses HTTP adapters against real production endpoints.
+ 
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 13c4f29..cf82b3e 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -115,7 +115,7 @@ flowchart LR
+   Repo --> DB[(PostgreSQL)]
+   Service --> Crypto[AES-GCM SecretBox]
+   Service --> Registry[Adapter Registry]
+-  Registry --> Sim[Demo Simulator Adapter]
++  Registry --> Sim[HTTP Health Adapter]
+   Registry --> HTTP[Lab/Production HTTP Adapter]
+   HTTP --> Tool[Prometheus/Grafana/Harbor/ArgoCD/etc]
+   Service --> Logs[Integration Logs + Audit Logs]

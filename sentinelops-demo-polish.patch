@@ -1,0 +1,295 @@
+diff -ru sentinelops_test_patch/apps/web/app/deployments/page.tsx sentinelops_next_patch/apps/web/app/deployments/page.tsx
+--- sentinelops_test_patch/apps/web/app/deployments/page.tsx	2026-07-07 14:50:05.805856167 +0000
++++ sentinelops_next_patch/apps/web/app/deployments/page.tsx	2026-07-07 15:08:55.095123448 +0000
+@@ -23,6 +23,7 @@
+ export default function DeploymentsPage() {
+   const queryClient = useQueryClient();
+   const [form, setForm] = useState({ applicationId: '', cluster: 'k3s-prod-01', namespace: '', version: 'v1.0.0' });
++  const [selectedDeployment, setSelectedDeployment] = useState<Deployment | null>(null);
+   const deployments = useQuery({ queryKey: ['deployments'], queryFn: api.deployments });
+   const apps = useQuery({ queryKey: ['applications'], queryFn: api.applications });
+ 
+@@ -74,7 +75,23 @@
+           {deployMutation.error ? <p className="mt-3 text-xs text-rose-300">{deployMutation.error.message}</p> : null}
+         </CardContent>
+       </Card>
+-      <DataTable columns={columns} data={deployments.data} />
++      <DataTable columns={columns} data={deployments.data} onRowClick={setSelectedDeployment} />
++      {selectedDeployment ? (
++        <Card>
++          <CardHeader>
++            <div className="flex items-center justify-between gap-3">
++              <CardTitle>Deployment Detail</CardTitle>
++              <Button className="border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800" onClick={() => setSelectedDeployment(null)}>Close</Button>
++            </div>
++          </CardHeader>
++          <CardContent className="grid gap-3 md:grid-cols-3">
++            <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4"><p className="text-xs text-slate-500">Application</p><p className="text-slate-100">{selectedDeployment.applicationName}</p></div>
++            <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4"><p className="text-xs text-slate-500">Cluster / Namespace</p><p className="text-slate-100">{selectedDeployment.cluster} · {selectedDeployment.namespace}</p></div>
++            <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4"><p className="text-xs text-slate-500">Health</p><div className="mt-2"><Badge variant={healthVariant(selectedDeployment.healthStatus)}>{selectedDeployment.healthStatus}</Badge></div></div>
++            <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 md:col-span-3"><p className="text-xs text-slate-500">Image</p><p className="mt-2 break-all text-sm text-slate-300">{selectedDeployment.image}:{selectedDeployment.version}</p></div>
++          </CardContent>
++        </Card>
++      ) : null}
+     </div>
+   );
+ }
+diff -ru sentinelops_test_patch/apps/web/app/pipelines/page.tsx sentinelops_next_patch/apps/web/app/pipelines/page.tsx
+--- sentinelops_test_patch/apps/web/app/pipelines/page.tsx	2026-07-07 14:50:05.805732043 +0000
++++ sentinelops_next_patch/apps/web/app/pipelines/page.tsx	2026-07-07 15:08:53.818177035 +0000
+@@ -23,6 +23,7 @@
+ export default function PipelinesPage() {
+   const queryClient = useQueryClient();
+   const [form, setForm] = useState({ applicationId: '', branch: 'main', stage: 'trivy-image-scan', status: 'success' });
++  const [selectedRun, setSelectedRun] = useState<PipelineRun | null>(null);
+   const pipelines = useQuery({ queryKey: ['pipelines'], queryFn: api.pipelines });
+   const apps = useQuery({ queryKey: ['applications'], queryFn: api.applications });
+ 
+@@ -83,7 +84,23 @@
+           {runMutation.error ? <p className="mt-3 text-xs text-rose-300">{runMutation.error.message}</p> : null}
+         </CardContent>
+       </Card>
+-      <DataTable columns={columns} data={pipelines.data} />
++      <DataTable columns={columns} data={pipelines.data} onRowClick={setSelectedRun} />
++      {selectedRun ? (
++        <Card>
++          <CardHeader>
++            <div className="flex items-center justify-between gap-3">
++              <CardTitle>Pipeline Run Detail</CardTitle>
++              <Button className="border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800" onClick={() => setSelectedRun(null)}>Close</Button>
++            </div>
++          </CardHeader>
++          <CardContent className="grid gap-3 md:grid-cols-3">
++            <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4"><p className="text-xs text-slate-500">Application</p><p className="text-slate-100">{selectedRun.applicationName}</p></div>
++            <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4"><p className="text-xs text-slate-500">Branch / Commit</p><p className="text-slate-100">{selectedRun.branch} · {selectedRun.commitSha}</p></div>
++            <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4"><p className="text-xs text-slate-500">Status</p><div className="mt-2"><Badge variant={statusVariant(selectedRun.status)}>{selectedRun.status}</Badge></div></div>
++            <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 md:col-span-3"><p className="text-xs text-slate-500">Stage</p><p className="mt-2 text-sm text-slate-300">{selectedRun.stage} finished in {selectedRun.durationSeconds || 'live'} seconds.</p></div>
++          </CardContent>
++        </Card>
++      ) : null}
+     </div>
+   );
+ }
+diff -ru sentinelops_test_patch/apps/web/app/security/page.tsx sentinelops_next_patch/apps/web/app/security/page.tsx
+--- sentinelops_test_patch/apps/web/app/security/page.tsx	2026-07-07 14:50:05.805970832 +0000
++++ sentinelops_next_patch/apps/web/app/security/page.tsx	2026-07-07 15:08:52.519068292 +0000
+@@ -23,6 +23,7 @@
+ export default function SecurityPage() {
+   const queryClient = useQueryClient();
+   const [form, setForm] = useState({ application: '', source: 'Trivy', severity: 'medium', title: '' });
++  const [selectedAlert, setSelectedAlert] = useState<SecurityAlert | null>(null);
+   const alerts = useQuery({ queryKey: ['security-alerts'], queryFn: api.alerts });
+   const apps = useQuery({ queryKey: ['applications'], queryFn: api.applications });
+ 
+@@ -96,7 +97,24 @@
+           {scanMutation.error ? <p className="mt-3 text-xs text-rose-300">{scanMutation.error.message}</p> : null}
+         </CardContent>
+       </Card>
+-      <DataTable columns={columns} data={alerts.data} />
++      <DataTable columns={columns} data={alerts.data} onRowClick={setSelectedAlert} />
++      {selectedAlert ? (
++        <Card>
++          <CardHeader>
++            <div className="flex items-center justify-between gap-3">
++              <CardTitle>Security Finding Detail</CardTitle>
++              <Button className="border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800" onClick={() => setSelectedAlert(null)}>Close</Button>
++            </div>
++          </CardHeader>
++          <CardContent className="grid gap-3 md:grid-cols-2">
++            <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4"><p className="text-xs text-slate-500">Finding</p><p className="text-slate-100">{selectedAlert.title}</p></div>
++            <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4"><p className="text-xs text-slate-500">Application</p><p className="text-slate-100">{selectedAlert.application}</p></div>
++            <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4"><p className="text-xs text-slate-500">Tool</p><p className="text-slate-100">{selectedAlert.source}</p></div>
++            <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4"><p className="text-xs text-slate-500">Severity / Status</p><div className="mt-2 flex gap-2"><Badge variant={severityVariant(selectedAlert.severity)}>{selectedAlert.severity}</Badge><Badge variant={selectedAlert.status === 'resolved' ? 'success' : 'muted'}>{selectedAlert.status}</Badge></div></div>
++            <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 md:col-span-2"><p className="text-xs text-slate-500">Recommended action</p><p className="mt-2 text-sm text-slate-300">Triage untuk acknowledge finding. Resolve jika sudah ada fix, exception, atau false positive yang terdokumentasi.</p></div>
++          </CardContent>
++        </Card>
++      ) : null}
+     </div>
+   );
+ }
+diff -ru sentinelops_test_patch/apps/web/app/settings/page.tsx sentinelops_next_patch/apps/web/app/settings/page.tsx
+--- sentinelops_test_patch/apps/web/app/settings/page.tsx	2026-07-07 13:57:00.672924167 +0000
++++ sentinelops_next_patch/apps/web/app/settings/page.tsx	2026-07-07 15:08:30.552849249 +0000
+@@ -1,31 +1,132 @@
+-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
++'use client';
++
++import { useEffect, useState } from 'react';
+ import { Badge } from '@/components/ui/badge';
++import { Button } from '@/components/ui/button';
++import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
++
++const inputClass = 'rounded-xl border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-cyan-400/50';
++
++const defaultSettings = {
++  environment: 'production',
++  role: 'platform-admin',
++  autoRefresh: '30',
++  apiBaseUrl: 'http://localhost:8080/api/v1',
++  keycloakEnabled: false,
++  gitopsEnabled: true,
++  securityGate: true,
++  observabilityEnabled: true
++};
+ 
+-const settings = [
+-  ['Authentication', 'Keycloak/OIDC boundary is present. Local development auth is disabled by default.'],
+-  ['GitOps', 'Argo CD application manifest is available under gitops/argocd.'],
+-  ['Policy', 'OPA Gatekeeper is represented as an integration and can be installed through cluster addons.'],
+-  ['Secrets', 'Vault/OpenBao is the intended backend for dynamic secrets and audit logs.'],
+-  ['Security Scanning', 'CI workflow includes scanner stages for Trivy, Semgrep, and Gitleaks.']
+-];
++type PlatformSettings = typeof defaultSettings;
+ 
+ export default function SettingsPage() {
++  const [settings, setSettings] = useState<PlatformSettings>(defaultSettings);
++  const [savedAt, setSavedAt] = useState<string>('');
++
++  useEffect(() => {
++    const saved = window.localStorage.getItem('sentinelops-settings');
++    if (saved) setSettings({ ...defaultSettings, ...JSON.parse(saved) });
++    setSavedAt(window.localStorage.getItem('sentinelops-settings-saved-at') ?? 'Not saved yet');
++  }, []);
++
++  function update<K extends keyof PlatformSettings>(key: K, value: PlatformSettings[K]) {
++    setSettings((current) => ({ ...current, [key]: value }));
++  }
++
++  function save() {
++    const timestamp = new Date().toLocaleString();
++    window.localStorage.setItem('sentinelops-settings', JSON.stringify(settings));
++    window.localStorage.setItem('sentinelops-settings-saved-at', timestamp);
++    setSavedAt(timestamp);
++  }
++
++  function reset() {
++    window.localStorage.removeItem('sentinelops-settings');
++    window.localStorage.removeItem('sentinelops-settings-saved-at');
++    setSettings(defaultSettings);
++    setSavedAt('Not saved yet');
++  }
++
+   return (
+-    <Card>
+-      <CardHeader>
+-        <CardTitle>Platform Settings</CardTitle>
+-      </CardHeader>
+-      <CardContent className="space-y-3">
+-        {settings.map(([name, description]) => (
+-          <div key={name} className="rounded-xl border border-slate-800 bg-slate-900/70 p-4">
+-            <div className="mb-2 flex items-center justify-between">
+-              <div className="font-medium text-slate-100">{name}</div>
+-              <Badge variant="success">configured</Badge>
++    <div className="space-y-4">
++      <Card>
++        <CardHeader>
++          <div className="flex flex-wrap items-center justify-between gap-3">
++            <div>
++              <CardTitle>Platform Settings</CardTitle>
++              <p className="mt-1 text-sm text-slate-500">Local runtime preferences for demo mode. Saved in browser localStorage.</p>
++            </div>
++            <Badge variant="success">editable</Badge>
++          </div>
++        </CardHeader>
++        <CardContent>
++          <div className="grid gap-4 md:grid-cols-2">
++            <label className="space-y-2 text-sm text-slate-300">
++              Environment
++              <select className={inputClass} value={settings.environment} onChange={(e) => update('environment', e.target.value)}>
++                <option value="dev">dev</option>
++                <option value="staging">staging</option>
++                <option value="production">production</option>
++              </select>
++            </label>
++            <label className="space-y-2 text-sm text-slate-300">
++              Active Role
++              <select className={inputClass} value={settings.role} onChange={(e) => update('role', e.target.value)}>
++                <option value="platform-admin">platform-admin</option>
++                <option value="developer">developer</option>
++                <option value="security-engineer">security-engineer</option>
++                <option value="viewer">viewer</option>
++              </select>
++            </label>
++            <label className="space-y-2 text-sm text-slate-300">
++              Dashboard Auto Refresh / seconds
++              <input className={inputClass} value={settings.autoRefresh} onChange={(e) => update('autoRefresh', e.target.value)} />
++            </label>
++            <label className="space-y-2 text-sm text-slate-300">
++              API Base URL
++              <input className={inputClass} value={settings.apiBaseUrl} onChange={(e) => update('apiBaseUrl', e.target.value)} />
++            </label>
++          </div>
++
++          <div className="mt-5 grid gap-3 md:grid-cols-2">
++            {[
++              ['keycloakEnabled', 'Enable Keycloak / OIDC boundary'],
++              ['gitopsEnabled', 'Enable GitOps deployment actions'],
++              ['securityGate', 'Enable security gate before deployment'],
++              ['observabilityEnabled', 'Enable observability widgets']
++            ].map(([key, label]) => (
++              <label key={key} className="flex items-center justify-between rounded-xl border border-slate-800 bg-slate-900/70 p-4 text-sm text-slate-300">
++                {label}
++                <input
++                  type="checkbox"
++                  checked={Boolean(settings[key as keyof PlatformSettings])}
++                  onChange={(e) => update(key as keyof PlatformSettings, e.target.checked as never)}
++                  className="h-4 w-4 accent-cyan-400"
++                />
++              </label>
++            ))}
++          </div>
++
++          <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-slate-800 pt-4">
++            <p className="text-xs text-slate-500">Last saved: {savedAt}</p>
++            <div className="flex gap-2">
++              <Button type="button" className="border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800" onClick={reset}>Reset</Button>
++              <Button type="button" onClick={save}>Save Settings</Button>
+             </div>
+-            <p className="text-sm text-slate-500">{description}</p>
+           </div>
+-        ))}
+-      </CardContent>
+-    </Card>
++        </CardContent>
++      </Card>
++
++      <Card>
++        <CardHeader><CardTitle>Runtime Preview</CardTitle></CardHeader>
++        <CardContent className="grid gap-3 md:grid-cols-4">
++          <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4"><p className="text-xs text-slate-500">Environment</p><p className="text-lg text-slate-100">{settings.environment}</p></div>
++          <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4"><p className="text-xs text-slate-500">Role</p><p className="text-lg text-slate-100">{settings.role}</p></div>
++          <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4"><p className="text-xs text-slate-500">Auto refresh</p><p className="text-lg text-slate-100">{settings.autoRefresh}s</p></div>
++          <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4"><p className="text-xs text-slate-500">GitOps</p><p className="text-lg text-slate-100">{settings.gitopsEnabled ? 'enabled' : 'disabled'}</p></div>
++        </CardContent>
++      </Card>
++    </div>
+   );
+ }
+diff -ru sentinelops_test_patch/apps/web/components/dashboard/data-table.tsx sentinelops_next_patch/apps/web/components/dashboard/data-table.tsx
+--- sentinelops_test_patch/apps/web/components/dashboard/data-table.tsx	2026-07-07 13:56:24.766543677 +0000
++++ sentinelops_next_patch/apps/web/components/dashboard/data-table.tsx	2026-07-07 15:08:30.539369216 +0000
+@@ -8,7 +8,7 @@
+   className?: string;
+ };
+ 
+-export function DataTable<T>({ columns, data }: { columns: Column<T>[]; data: T[] }) {
++export function DataTable<T>({ columns, data, onRowClick }: { columns: Column<T>[]; data: T[]; onRowClick?: (row: T) => void }) {
+   return (
+     <Card className="overflow-hidden">
+       <div className="overflow-x-auto">
+@@ -22,7 +22,14 @@
+           </thead>
+           <tbody className="divide-y divide-slate-800">
+             {data.map((row, index) => (
+-              <tr key={index} className="bg-slate-950/40 text-slate-300 transition hover:bg-slate-900/70">
++              <tr
++                key={index}
++                onClick={() => onRowClick?.(row)}
++                className={cn(
++                  'bg-slate-950/40 text-slate-300 transition hover:bg-slate-900/70',
++                  onRowClick && 'cursor-pointer'
++                )}
++              >
+                 {columns.map((column) => (
+                   <td key={column.key} className={cn('px-4 py-4', column.className)}>{column.cell(row)}</td>
+                 ))}

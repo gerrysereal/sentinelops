@@ -1,0 +1,1986 @@
+diff -ruN sentinelops_active_base/.env.example sentinelops_prod/.env.example
+--- sentinelops_active_base/.env.example	2026-07-07 13:53:28.536994376 +0000
++++ sentinelops_prod/.env.example	2026-07-07 15:20:24.515507975 +0000
+@@ -10,3 +10,6 @@
+ KEYCLOAK_ISSUER_URL=http://keycloak:8080/realms/sentinelops
+ KEYCLOAK_CLIENT_ID=sentinelops-web
+ NEXT_PUBLIC_API_BASE_URL=http://localhost:8080/api/v1
++
++PLATFORM_MODE=demo
++INTEGRATION_ENCRYPTION_KEY=sentinelops-local-dev-key-change-me
+diff -ruN sentinelops_active_base/README.md sentinelops_prod/README.md
+--- sentinelops_active_base/README.md	2026-07-07 15:06:50.654357787 +0000
++++ sentinelops_prod/README.md	2026-07-07 15:21:31.515452223 +0000
+@@ -117,3 +117,32 @@
+ ## Design Philosophy
+ 
+ SentinelOps follows a modular platform architecture. The first production milestone focuses on a reliable IDP control plane and integration model before attempting to run every external tool inside the same repository. This avoids unnecessary local complexity while preserving a clear path toward enterprise deployment.
++
++## Production-Oriented Settings Module
++
++The Settings page is backed by the API and PostgreSQL. It supports integration lifecycle operations:
++
++- Add Integration
++- Edit Integration
++- Delete Integration
++- Enable / Disable Integration
++- Test Connection
++- Sync Data
++- View Health
++- View Last Sync
++- View Integration Logs
++
++Credentials are encrypted before storage. Set `INTEGRATION_ENCRYPTION_KEY` in `.env` before running anything beyond local demo mode.
++
++```bash
++PLATFORM_MODE=demo docker-compose up --build
++```
++
++Switching modes:
++
++```env
++PLATFORM_MODE=demo        # simulator adapters
++PLATFORM_MODE=lab         # HTTP adapters for Docker Compose/lab services
++PLATFORM_MODE=production  # HTTP adapters for real endpoints
++```
++
+diff -ruN sentinelops_active_base/apps/api/cmd/api/main.go sentinelops_prod/apps/api/cmd/api/main.go
+--- sentinelops_active_base/apps/api/cmd/api/main.go	2026-07-07 13:53:48.346651769 +0000
++++ sentinelops_prod/apps/api/cmd/api/main.go	2026-07-07 15:20:30.586319247 +0000
+@@ -10,8 +10,10 @@
+ 	"github.com/sentinelops/sentinelops/apps/api/internal/config"
+ 	"github.com/sentinelops/sentinelops/apps/api/internal/platform/auth"
+ 	"github.com/sentinelops/sentinelops/apps/api/internal/platform/cache"
++	secretcrypto "github.com/sentinelops/sentinelops/apps/api/internal/platform/crypto"
+ 	"github.com/sentinelops/sentinelops/apps/api/internal/platform/database"
+ 	httpplatform "github.com/sentinelops/sentinelops/apps/api/internal/platform/http"
++	"github.com/sentinelops/sentinelops/apps/api/internal/platform/integrations"
+ )
+ 
+ func main() {
+@@ -40,8 +42,15 @@
+ 	overviewService := application.NewOverviewService(repository, redisClient)
+ 	moduleService := application.NewModuleService(repository)
+ 
++	secretBox, err := secretcrypto.NewSecretBox(cfg.EncryptionKey)
++	if err != nil {
++		log.Fatalf("initialize secret box: %v", err)
++	}
++	integrationRegistry := integrations.NewRegistry(cfg.PlatformMode)
++	integrationService := application.NewIntegrationService(repository, secretBox, integrationRegistry, cfg.PlatformMode)
++
+ 	authMiddleware := auth.NewMiddleware(cfg)
+-	router := httpplatform.NewRouter(cfg, overviewService, moduleService, authMiddleware)
++	router := httpplatform.NewRouter(cfg, overviewService, moduleService, integrationService, authMiddleware)
+ 
+ 	server := &http.Server{
+ 		Addr:              ":" + cfg.APIPort,
+diff -ruN sentinelops_active_base/apps/api/internal/application/integration_service.go sentinelops_prod/apps/api/internal/application/integration_service.go
+--- sentinelops_active_base/apps/api/internal/application/integration_service.go	1970-01-01 00:00:00.000000000 +0000
++++ sentinelops_prod/apps/api/internal/application/integration_service.go	2026-07-07 15:18:09.961181499 +0000
+@@ -0,0 +1,216 @@
++package application
++
++import (
++	"context"
++	"fmt"
++	"strings"
++
++	"github.com/sentinelops/sentinelops/apps/api/internal/domain"
++	secretcrypto "github.com/sentinelops/sentinelops/apps/api/internal/platform/crypto"
++	"github.com/sentinelops/sentinelops/apps/api/internal/platform/database"
++	"github.com/sentinelops/sentinelops/apps/api/internal/ports"
++)
++
++type IntegrationService struct {
++	repo      *database.Repository
++	secretBox *secretcrypto.SecretBox
++	registry  ports.IntegrationRegistry
++	mode      string
++}
++
++func NewIntegrationService(repo *database.Repository, secretBox *secretcrypto.SecretBox, registry ports.IntegrationRegistry, mode string) *IntegrationService {
++	if strings.TrimSpace(mode) == "" {
++		mode = domain.IntegrationModeDemo
++	}
++	return &IntegrationService{repo: repo, secretBox: secretBox, registry: registry, mode: mode}
++}
++
++func (s *IntegrationService) List(ctx context.Context) ([]domain.IntegrationConfig, error) {
++	return s.repo.ListIntegrations(ctx)
++}
++
++func (s *IntegrationService) Get(ctx context.Context, id string) (domain.IntegrationConfig, error) {
++	item, err := s.repo.GetIntegration(ctx, id)
++	if err != nil {
++		return domain.IntegrationConfig{}, err
++	}
++	return s.decrypt(item)
++}
++
++func (s *IntegrationService) Create(ctx context.Context, req domain.CreateIntegrationRequest) (domain.IntegrationConfig, error) {
++	cfg := domain.IntegrationConfig{
++		Name:                strings.TrimSpace(req.Name),
++		Type:                strings.TrimSpace(req.Type),
++		Category:            categoryFor(req.Type, req.Category),
++		EndpointURL:         strings.TrimSpace(req.EndpointURL),
++		Username:            strings.TrimSpace(req.Username),
++		Namespace:           strings.TrimSpace(req.Namespace),
++		TLSVerify:           true,
++		SyncIntervalSeconds: req.SyncIntervalSeconds,
++		Enabled:             req.Enabled,
++		Status:              domain.IntegrationStatusDisabled,
++		Mode:                s.mode,
++		Health:              "Not tested yet",
++	}
++	if req.TLSVerify != nil {
++		cfg.TLSVerify = *req.TLSVerify
++	}
++	if cfg.SyncIntervalSeconds == 0 {
++		cfg.SyncIntervalSeconds = 60
++	}
++	if cfg.Enabled {
++		cfg.Status = domain.IntegrationStatusUnknown
++	}
++
++	var err error
++	cfg.AccessToken, err = s.secretBox.Encrypt(req.AccessToken)
++	if err != nil {
++		return domain.IntegrationConfig{}, err
++	}
++	cfg.Password, err = s.secretBox.Encrypt(req.Password)
++	if err != nil {
++		return domain.IntegrationConfig{}, err
++	}
++
++	return s.repo.CreateIntegration(ctx, cfg)
++}
++
++func (s *IntegrationService) Update(ctx context.Context, id string, req domain.UpdateIntegrationRequest) (domain.IntegrationConfig, error) {
++	cfg, err := s.repo.GetIntegration(ctx, id)
++	if err != nil {
++		return domain.IntegrationConfig{}, err
++	}
++	if req.Name != nil {
++		cfg.Name = strings.TrimSpace(*req.Name)
++	}
++	if req.Category != nil {
++		cfg.Category = categoryFor(cfg.Type, *req.Category)
++	}
++	if req.EndpointURL != nil {
++		cfg.EndpointURL = strings.TrimSpace(*req.EndpointURL)
++	}
++	if req.Username != nil {
++		cfg.Username = strings.TrimSpace(*req.Username)
++	}
++	if req.Namespace != nil {
++		cfg.Namespace = strings.TrimSpace(*req.Namespace)
++	}
++	if req.TLSVerify != nil {
++		cfg.TLSVerify = *req.TLSVerify
++	}
++	if req.SyncIntervalSeconds != nil {
++		cfg.SyncIntervalSeconds = *req.SyncIntervalSeconds
++	}
++	if req.Enabled != nil {
++		cfg.Enabled = *req.Enabled
++		if !cfg.Enabled {
++			cfg.Status = domain.IntegrationStatusDisabled
++		} else if cfg.Status == domain.IntegrationStatusDisabled {
++			cfg.Status = domain.IntegrationStatusUnknown
++		}
++	}
++	if req.AccessToken != nil {
++		cfg.AccessToken, err = s.secretBox.Encrypt(*req.AccessToken)
++		if err != nil {
++			return domain.IntegrationConfig{}, err
++		}
++	}
++	if req.Password != nil {
++		cfg.Password, err = s.secretBox.Encrypt(*req.Password)
++		if err != nil {
++			return domain.IntegrationConfig{}, err
++		}
++	}
++	return s.repo.UpdateIntegration(ctx, cfg)
++}
++
++func (s *IntegrationService) Delete(ctx context.Context, id string) error {
++	return s.repo.DeleteIntegration(ctx, id)
++}
++
++func (s *IntegrationService) SetEnabled(ctx context.Context, id string, req domain.SetIntegrationEnabledRequest) (domain.IntegrationConfig, error) {
++	return s.repo.SetIntegrationEnabled(ctx, id, req.Enabled)
++}
++
++func (s *IntegrationService) TestConnection(ctx context.Context, id string) (domain.IntegrationHealth, error) {
++	cfg, err := s.Get(ctx, id)
++	if err != nil {
++		return domain.IntegrationHealth{}, err
++	}
++	health, err := s.registry.For(ctx, cfg).Health(ctx, cfg)
++	if err != nil {
++		return domain.IntegrationHealth{}, err
++	}
++	_, err = s.repo.UpdateIntegrationHealth(ctx, id, health)
++	return health, err
++}
++
++func (s *IntegrationService) Sync(ctx context.Context, id string) (domain.IntegrationSyncResult, error) {
++	cfg, err := s.Get(ctx, id)
++	if err != nil {
++		return domain.IntegrationSyncResult{}, err
++	}
++	result, err := s.registry.For(ctx, cfg).Sync(ctx, cfg)
++	if err != nil {
++		return domain.IntegrationSyncResult{}, err
++	}
++	_, err = s.repo.MarkIntegrationSynced(ctx, id, result)
++	if err != nil {
++		return domain.IntegrationSyncResult{}, err
++	}
++	_ = s.repo.CreateObservabilitySignal(ctx, cfg.Type, "integration_sync", statusToSignal(result.Status), fmt.Sprintf("%s: %s", cfg.Name, result.Message))
++	return result, nil
++}
++
++func (s *IntegrationService) Logs(ctx context.Context, id string) ([]domain.IntegrationLog, error) {
++	return s.repo.ListIntegrationLogs(ctx, id)
++}
++
++func (s *IntegrationService) decrypt(cfg domain.IntegrationConfig) (domain.IntegrationConfig, error) {
++	var err error
++	cfg.AccessToken, err = s.secretBox.Decrypt(cfg.AccessToken)
++	if err != nil {
++		return domain.IntegrationConfig{}, err
++	}
++	cfg.Password, err = s.secretBox.Decrypt(cfg.Password)
++	if err != nil {
++		return domain.IntegrationConfig{}, err
++	}
++	return cfg, nil
++}
++
++func categoryFor(toolType string, fallback string) string {
++	fallback = strings.TrimSpace(fallback)
++	if fallback != "" {
++		return fallback
++	}
++	switch toolType {
++	case "Prometheus", "Grafana", "Loki", "Tempo":
++		return "Observability"
++	case "Harbor":
++		return "Registry"
++	case "Vault":
++		return "Secrets"
++	case "GitHub", "GitHubActions":
++		return "CI/CD"
++	case "ArgoCD", "Kubernetes":
++		return "GitOps"
++	case "SonarQube", "Trivy", "Semgrep", "Gitleaks", "Falco", "Wazuh", "OPA-Gatekeeper":
++		return "Security"
++	case "Keycloak":
++		return "Authentication"
++	default:
++		return "Platform"
++	}
++}
++
++func statusToSignal(status string) string {
++	switch status {
++	case domain.IntegrationStatusConnected:
++		return "healthy"
++	case domain.IntegrationStatusDisabled:
++		return "warning"
++	default:
++		return "warning"
++	}
++}
+diff -ruN sentinelops_active_base/apps/api/internal/application/module_service.go sentinelops_prod/apps/api/internal/application/module_service.go
+--- sentinelops_active_base/apps/api/internal/application/module_service.go	2026-07-07 15:14:06.687316595 +0000
++++ sentinelops_prod/apps/api/internal/application/module_service.go	2026-07-07 15:18:37.014114938 +0000
+@@ -55,10 +55,6 @@
+ 	return s.repo.ListObservabilitySignals(ctx)
+ }
+ 
+-func (s *ModuleService) ListIntegrations(ctx context.Context) ([]domain.Integration, error) {
+-	return defaultIntegrations(), nil
+-}
+-
+ func (s *ModuleService) ListRegistryArtifacts(ctx context.Context) ([]domain.RegistryArtifact, error) {
+ 	return s.repo.ListRegistryArtifacts(ctx)
+ }
+diff -ruN sentinelops_active_base/apps/api/internal/application/overview_service.go sentinelops_prod/apps/api/internal/application/overview_service.go
+--- sentinelops_active_base/apps/api/internal/application/overview_service.go	2026-07-07 15:14:06.687859565 +0000
++++ sentinelops_prod/apps/api/internal/application/overview_service.go	2026-07-07 15:20:30.591940860 +0000
+@@ -73,6 +73,11 @@
+ 		return domain.Overview{}, err
+ 	}
+ 
++	integrationList, err := s.repo.ListIntegrations(ctx)
++	if err != nil {
++		return domain.Overview{}, err
++	}
++
+ 	nodes := max(1, clustersCount*4)
+ 	pods := max(1, deploymentsCount*13)
+ 
+@@ -90,7 +95,7 @@
+ 			"storage": min(89, 31+applicationsCount*3),
+ 		},
+ 		RecentAlerts: recentAlerts,
+-		Integrations: defaultIntegrations(),
++		Integrations: integrationList,
+ 	}
+ 
+ 	if s.redis != nil {
+@@ -101,21 +106,6 @@
+ 	return overview, nil
+ }
+ 
+-func defaultIntegrations() []domain.Integration {
+-	return []domain.Integration{
+-		{Name: "Argo CD", Category: "GitOps", Status: "healthy", Endpoint: "argocd.sentinelops.local"},
+-		{Name: "Harbor", Category: "Registry", Status: "healthy", Endpoint: "harbor.sentinelops.local"},
+-		{Name: "Vault/OpenBao", Category: "Secrets", Status: "healthy", Endpoint: "vault.sentinelops.local"},
+-		{Name: "Prometheus", Category: "Metrics", Status: "healthy", Endpoint: "prometheus.sentinelops.local"},
+-		{Name: "Grafana", Category: "Visualization", Status: "healthy", Endpoint: "grafana.sentinelops.local"},
+-		{Name: "Loki", Category: "Logging", Status: "healthy", Endpoint: "loki.sentinelops.local"},
+-		{Name: "Tempo", Category: "Tracing", Status: "degraded", Endpoint: "tempo.sentinelops.local"},
+-		{Name: "Falco", Category: "Runtime Security", Status: "warning", Endpoint: "falco.sentinelops.local"},
+-		{Name: "Wazuh", Category: "SIEM", Status: "healthy", Endpoint: "wazuh.sentinelops.local"},
+-		{Name: "OPA Gatekeeper", Category: "Policy", Status: "healthy", Endpoint: "gatekeeper.sentinelops.local"},
+-	}
+-}
+-
+ func min(a, b int) int {
+ 	if a < b {
+ 		return a
+diff -ruN sentinelops_active_base/apps/api/internal/config/config.go sentinelops_prod/apps/api/internal/config/config.go
+--- sentinelops_active_base/apps/api/internal/config/config.go	2026-07-07 13:53:48.355143152 +0000
++++ sentinelops_prod/apps/api/internal/config/config.go	2026-07-07 15:16:13.433252150 +0000
+@@ -11,6 +11,8 @@
+ 	AuthEnabled       bool
+ 	KeycloakIssuerURL string
+ 	KeycloakClientID  string
++	PlatformMode      string
++	EncryptionKey     string
+ }
+ 
+ func Load() Config {
+@@ -23,6 +25,8 @@
+ 		AuthEnabled:       getEnv("AUTH_ENABLED", "false") == "true",
+ 		KeycloakIssuerURL: getEnv("KEYCLOAK_ISSUER_URL", "http://localhost:8081/realms/sentinelops"),
+ 		KeycloakClientID:  getEnv("KEYCLOAK_CLIENT_ID", "sentinelops-web"),
++		PlatformMode:      getEnv("PLATFORM_MODE", "demo"),
++		EncryptionKey:     getEnv("INTEGRATION_ENCRYPTION_KEY", "sentinelops-local-dev-key-change-me"),
+ 	}
+ }
+ 
+diff -ruN sentinelops_active_base/apps/api/internal/domain/integration_models.go sentinelops_prod/apps/api/internal/domain/integration_models.go
+--- sentinelops_active_base/apps/api/internal/domain/integration_models.go	1970-01-01 00:00:00.000000000 +0000
++++ sentinelops_prod/apps/api/internal/domain/integration_models.go	2026-07-07 15:20:30.587359150 +0000
+@@ -0,0 +1,94 @@
++package domain
++
++import "time"
++
++const (
++	IntegrationStatusUnknown      = "unknown"
++	IntegrationStatusConnected    = "connected"
++	IntegrationStatusDisconnected = "disconnected"
++	IntegrationStatusDisabled     = "disabled"
++	IntegrationStatusSyncing      = "syncing"
++	IntegrationStatusError        = "error"
++	IntegrationModeDemo           = "demo"
++	IntegrationModeLab            = "lab"
++	IntegrationModeProduction     = "production"
++)
++
++type IntegrationConfig struct {
++	ID                  string     `json:"id"`
++	Name                string     `json:"name"`
++	Type                string     `json:"type"`
++	Category            string     `json:"category"`
++	EndpointURL         string     `json:"endpointUrl"`
++	Username            string     `json:"username,omitempty"`
++	Namespace           string     `json:"namespace,omitempty"`
++	TLSVerify           bool       `json:"tlsVerify"`
++	SyncIntervalSeconds int        `json:"syncIntervalSeconds"`
++	Enabled             bool       `json:"enabled"`
++	Status              string     `json:"status"`
++	Mode                string     `json:"mode"`
++	Health              string     `json:"health"`
++	LastSyncAt          *time.Time `json:"lastSyncAt,omitempty"`
++	CreatedAt           time.Time  `json:"createdAt"`
++	UpdatedAt           time.Time  `json:"updatedAt"`
++	HasAccessToken      bool       `json:"hasAccessToken"`
++	HasPassword         bool       `json:"hasPassword"`
++	AccessToken         string     `json:"-"`
++	Password            string     `json:"-"`
++}
++
++type IntegrationLog struct {
++	ID            string    `json:"id"`
++	IntegrationID string    `json:"integrationId"`
++	Action        string    `json:"action"`
++	Status        string    `json:"status"`
++	Message       string    `json:"message"`
++	CreatedAt     time.Time `json:"createdAt"`
++}
++
++type IntegrationHealth struct {
++	Status     string            `json:"status"`
++	Healthy    bool              `json:"healthy"`
++	Message    string            `json:"message"`
++	CheckedAt  time.Time         `json:"checkedAt"`
++	Attributes map[string]string `json:"attributes"`
++}
++
++type IntegrationSyncResult struct {
++	Status    string            `json:"status"`
++	Message   string            `json:"message"`
++	SyncedAt  time.Time         `json:"syncedAt"`
++	Resources map[string]int    `json:"resources"`
++	Metadata  map[string]string `json:"metadata"`
++}
++
++type CreateIntegrationRequest struct {
++	Name                string `json:"name" binding:"required,min=2,max=80"`
++	Type                string `json:"type" binding:"required,oneof=Prometheus Grafana Harbor Vault GitHub GitHubActions ArgoCD Kubernetes Loki Tempo SonarQube Trivy Semgrep Gitleaks Falco Wazuh Keycloak OPA-Gatekeeper"`
++	Category            string `json:"category" binding:"omitempty,max=80"`
++	EndpointURL         string `json:"endpointUrl" binding:"required,url"`
++	AccessToken         string `json:"accessToken" binding:"omitempty"`
++	Username            string `json:"username" binding:"omitempty,max=120"`
++	Password            string `json:"password" binding:"omitempty"`
++	Namespace           string `json:"namespace" binding:"omitempty,max=120"`
++	TLSVerify           *bool  `json:"tlsVerify"`
++	SyncIntervalSeconds int    `json:"syncIntervalSeconds" binding:"omitempty,min=15,max=86400"`
++	Enabled             bool   `json:"enabled"`
++}
++
++type UpdateIntegrationRequest struct {
++	Name                *string `json:"name" binding:"omitempty,min=2,max=80"`
++	Category            *string `json:"category" binding:"omitempty,max=80"`
++	EndpointURL         *string `json:"endpointUrl" binding:"omitempty,url"`
++	AccessToken         *string `json:"accessToken"`
++	Username            *string `json:"username" binding:"omitempty,max=120"`
++	Password            *string `json:"password"`
++	Namespace           *string `json:"namespace" binding:"omitempty,max=120"`
++	TLSVerify           *bool   `json:"tlsVerify"`
++	SyncIntervalSeconds *int    `json:"syncIntervalSeconds" binding:"omitempty,min=15,max=86400"`
++	Enabled             *bool   `json:"enabled"`
++}
++
++type SetIntegrationEnabledRequest struct {
++	Enabled bool `json:"enabled"`
++}
+diff -ruN sentinelops_active_base/apps/api/internal/domain/models.go sentinelops_prod/apps/api/internal/domain/models.go
+--- sentinelops_active_base/apps/api/internal/domain/models.go	2026-07-07 15:14:06.688093672 +0000
++++ sentinelops_prod/apps/api/internal/domain/models.go	2026-07-07 15:20:30.586494226 +0000
+@@ -56,13 +56,6 @@
+ 	CreatedAt time.Time `json:"createdAt"`
+ }
+ 
+-type Integration struct {
+-	Name     string `json:"name"`
+-	Category string `json:"category"`
+-	Status   string `json:"status"`
+-	Endpoint string `json:"endpoint"`
+-}
+-
+ type RegistryArtifact struct {
+ 	ID        string `json:"id"`
+ 	Name      string `json:"name"`
+@@ -75,16 +68,16 @@
+ }
+ 
+ type Overview struct {
+-	ApplicationsCount int             `json:"applicationsCount"`
+-	ClustersCount     int             `json:"clustersCount"`
+-	NodesCount        int             `json:"nodesCount"`
+-	PodsCount         int             `json:"podsCount"`
+-	DeploymentStatus  map[string]int  `json:"deploymentStatus"`
+-	PipelineStatus    map[string]int  `json:"pipelineStatus"`
+-	SecuritySeverity  map[string]int  `json:"securitySeverity"`
+-	ResourceUsage     map[string]int  `json:"resourceUsage"`
+-	RecentAlerts      []SecurityAlert `json:"recentAlerts"`
+-	Integrations      []Integration   `json:"integrations"`
++	ApplicationsCount int                 `json:"applicationsCount"`
++	ClustersCount     int                 `json:"clustersCount"`
++	NodesCount        int                 `json:"nodesCount"`
++	PodsCount         int                 `json:"podsCount"`
++	DeploymentStatus  map[string]int      `json:"deploymentStatus"`
++	PipelineStatus    map[string]int      `json:"pipelineStatus"`
++	SecuritySeverity  map[string]int      `json:"securitySeverity"`
++	ResourceUsage     map[string]int      `json:"resourceUsage"`
++	RecentAlerts      []SecurityAlert     `json:"recentAlerts"`
++	Integrations      []IntegrationConfig `json:"integrations"`
+ }
+ 
+ type CreateApplicationRequest struct {
+diff -ruN sentinelops_active_base/apps/api/internal/platform/crypto/secretbox.go sentinelops_prod/apps/api/internal/platform/crypto/secretbox.go
+--- sentinelops_active_base/apps/api/internal/platform/crypto/secretbox.go	1970-01-01 00:00:00.000000000 +0000
++++ sentinelops_prod/apps/api/internal/platform/crypto/secretbox.go	2026-07-07 15:15:42.670964581 +0000
+@@ -0,0 +1,63 @@
++package crypto
++
++import (
++	"crypto/aes"
++	"crypto/cipher"
++	"crypto/rand"
++	"crypto/sha256"
++	"encoding/base64"
++	"fmt"
++	"io"
++)
++
++type SecretBox struct {
++	aead cipher.AEAD
++}
++
++func NewSecretBox(key string) (*SecretBox, error) {
++	if key == "" {
++		key = "sentinelops-local-dev-key-change-me"
++	}
++	digest := sha256.Sum256([]byte(key))
++	block, err := aes.NewCipher(digest[:])
++	if err != nil {
++		return nil, fmt.Errorf("create cipher: %w", err)
++	}
++	aead, err := cipher.NewGCM(block)
++	if err != nil {
++		return nil, fmt.Errorf("create gcm: %w", err)
++	}
++	return &SecretBox{aead: aead}, nil
++}
++
++func (s *SecretBox) Encrypt(value string) (string, error) {
++	if value == "" {
++		return "", nil
++	}
++	nonce := make([]byte, s.aead.NonceSize())
++	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
++		return "", fmt.Errorf("generate nonce: %w", err)
++	}
++	sealed := s.aead.Seal(nonce, nonce, []byte(value), nil)
++	return base64.StdEncoding.EncodeToString(sealed), nil
++}
++
++func (s *SecretBox) Decrypt(value string) (string, error) {
++	if value == "" {
++		return "", nil
++	}
++	payload, err := base64.StdEncoding.DecodeString(value)
++	if err != nil {
++		return "", fmt.Errorf("decode secret: %w", err)
++	}
++	nonceSize := s.aead.NonceSize()
++	if len(payload) < nonceSize {
++		return "", fmt.Errorf("invalid secret payload")
++	}
++	nonce, ciphertext := payload[:nonceSize], payload[nonceSize:]
++	plain, err := s.aead.Open(nil, nonce, ciphertext, nil)
++	if err != nil {
++		return "", fmt.Errorf("decrypt secret: %w", err)
++	}
++	return string(plain), nil
++}
+diff -ruN sentinelops_active_base/apps/api/internal/platform/database/postgres.go sentinelops_prod/apps/api/internal/platform/database/postgres.go
+--- sentinelops_active_base/apps/api/internal/platform/database/postgres.go	2026-07-07 13:54:10.973375817 +0000
++++ sentinelops_prod/apps/api/internal/platform/database/postgres.go	2026-07-07 15:16:41.147937687 +0000
+@@ -80,6 +80,87 @@
+ 		`CREATE INDEX IF NOT EXISTS idx_pipeline_runs_application_id ON pipeline_runs(application_id);`,
+ 		`CREATE INDEX IF NOT EXISTS idx_deployments_application_id ON deployments(application_id);`,
+ 		`CREATE INDEX IF NOT EXISTS idx_security_alerts_detected_at ON security_alerts(detected_at DESC);`,
++		`CREATE TABLE IF NOT EXISTS roles (
++			id TEXT PRIMARY KEY,
++			name TEXT NOT NULL UNIQUE,
++			description TEXT NOT NULL DEFAULT '',
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);`,
++		`CREATE TABLE IF NOT EXISTS users (
++			id TEXT PRIMARY KEY,
++			email TEXT NOT NULL UNIQUE,
++			display_name TEXT NOT NULL,
++			role_id TEXT REFERENCES roles(id),
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);`,
++		`CREATE TABLE IF NOT EXISTS projects (
++			id TEXT PRIMARY KEY,
++			name TEXT NOT NULL UNIQUE,
++			owner_name TEXT NOT NULL,
++			environment TEXT NOT NULL,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);`,
++		`CREATE TABLE IF NOT EXISTS clusters (
++			id TEXT PRIMARY KEY,
++			name TEXT NOT NULL UNIQUE,
++			provider TEXT NOT NULL,
++			region TEXT NOT NULL DEFAULT '',
++			kube_context TEXT NOT NULL DEFAULT '',
++			status TEXT NOT NULL DEFAULT 'unknown',
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);`,
++		`CREATE TABLE IF NOT EXISTS integrations (
++			id TEXT PRIMARY KEY,
++			name TEXT NOT NULL,
++			tool_type TEXT NOT NULL,
++			category TEXT NOT NULL,
++			endpoint_url TEXT NOT NULL,
++			access_token_encrypted TEXT NOT NULL DEFAULT '',
++			username TEXT NOT NULL DEFAULT '',
++			password_encrypted TEXT NOT NULL DEFAULT '',
++			namespace TEXT NOT NULL DEFAULT '',
++			tls_verify BOOLEAN NOT NULL DEFAULT true,
++			sync_interval_seconds INT NOT NULL DEFAULT 60,
++			enabled BOOLEAN NOT NULL DEFAULT false,
++			status TEXT NOT NULL DEFAULT 'unknown',
++			mode TEXT NOT NULL DEFAULT 'demo',
++			last_health TEXT NOT NULL DEFAULT '',
++			last_sync_at TIMESTAMPTZ,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
++			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);`,
++		`CREATE UNIQUE INDEX IF NOT EXISTS idx_integrations_name_lower ON integrations (lower(name));`,
++		`CREATE TABLE IF NOT EXISTS integration_logs (
++			id TEXT PRIMARY KEY,
++			integration_id TEXT NOT NULL REFERENCES integrations(id) ON DELETE CASCADE,
++			action TEXT NOT NULL,
++			status TEXT NOT NULL,
++			message TEXT NOT NULL,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);`,
++		`CREATE TABLE IF NOT EXISTS notifications (
++			id TEXT PRIMARY KEY,
++			channel TEXT NOT NULL,
++			target TEXT NOT NULL,
++			enabled BOOLEAN NOT NULL DEFAULT true,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);`,
++		`CREATE TABLE IF NOT EXISTS audit_logs (
++			id TEXT PRIMARY KEY,
++			actor TEXT NOT NULL DEFAULT 'system',
++			action TEXT NOT NULL,
++			resource_type TEXT NOT NULL,
++			resource_id TEXT NOT NULL,
++			message TEXT NOT NULL,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);`,
++		`CREATE TABLE IF NOT EXISTS settings (
++			key TEXT PRIMARY KEY,
++			value TEXT NOT NULL,
++			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
++		);`,
++		`CREATE INDEX IF NOT EXISTS idx_integration_logs_integration_id ON integration_logs(integration_id);`,
++		`CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);`,
+ 	}
+ 
+ 	for _, statement := range statements {
+diff -ruN sentinelops_active_base/apps/api/internal/platform/database/repository.go sentinelops_prod/apps/api/internal/platform/database/repository.go
+--- sentinelops_active_base/apps/api/internal/platform/database/repository.go	2026-07-07 15:14:06.688456030 +0000
++++ sentinelops_prod/apps/api/internal/platform/database/repository.go	2026-07-07 15:20:30.593442602 +0000
+@@ -3,6 +3,7 @@
+ import (
+ 	"context"
+ 	"crypto/rand"
++	stdsql "database/sql"
+ 	"encoding/hex"
+ 	"fmt"
+ 	"strings"
+@@ -396,3 +397,243 @@
+ 		return fmt.Sprintf("%s severity security finding", severity)
+ 	}
+ }
++
++func (r *Repository) ListIntegrations(ctx context.Context) ([]domain.IntegrationConfig, error) {
++	rows, err := r.pool.Query(ctx, `
++		SELECT id, name, tool_type, category, endpoint_url, username, namespace, tls_verify,
++			sync_interval_seconds, enabled, status, mode, last_health, last_sync_at, created_at, updated_at,
++			access_token_encrypted <> '', password_encrypted <> ''
++		FROM integrations
++		ORDER BY category, name`)
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++
++	items := make([]domain.IntegrationConfig, 0)
++	for rows.Next() {
++		item, err := scanIntegrationPublic(rows)
++		if err != nil {
++			return nil, err
++		}
++		items = append(items, item)
++	}
++	return items, rows.Err()
++}
++
++func (r *Repository) GetIntegration(ctx context.Context, id string) (domain.IntegrationConfig, error) {
++	row := r.pool.QueryRow(ctx, `
++		SELECT id, name, tool_type, category, endpoint_url, username, namespace, tls_verify,
++			sync_interval_seconds, enabled, status, mode, last_health, last_sync_at, created_at, updated_at,
++			access_token_encrypted <> '', password_encrypted <> '', access_token_encrypted, password_encrypted
++		FROM integrations
++		WHERE id = $1`, id)
++	return scanIntegrationPrivate(row)
++}
++
++func (r *Repository) CreateIntegration(ctx context.Context, cfg domain.IntegrationConfig) (domain.IntegrationConfig, error) {
++	if cfg.ID == "" {
++		cfg.ID = "int-" + randomHex(8)
++	}
++	if cfg.Status == "" {
++		if cfg.Enabled {
++			cfg.Status = domain.IntegrationStatusUnknown
++		} else {
++			cfg.Status = domain.IntegrationStatusDisabled
++		}
++	}
++	if cfg.SyncIntervalSeconds == 0 {
++		cfg.SyncIntervalSeconds = 60
++	}
++
++	row := r.pool.QueryRow(ctx, `
++		INSERT INTO integrations
++		(id, name, tool_type, category, endpoint_url, access_token_encrypted, username, password_encrypted, namespace,
++		 tls_verify, sync_interval_seconds, enabled, status, mode, last_health)
++		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
++		RETURNING id, name, tool_type, category, endpoint_url, username, namespace, tls_verify,
++			sync_interval_seconds, enabled, status, mode, last_health, last_sync_at, created_at, updated_at,
++			access_token_encrypted <> '', password_encrypted <> ''`,
++		cfg.ID, cfg.Name, cfg.Type, cfg.Category, cfg.EndpointURL, cfg.AccessToken, cfg.Username, cfg.Password, cfg.Namespace,
++		cfg.TLSVerify, cfg.SyncIntervalSeconds, cfg.Enabled, cfg.Status, cfg.Mode, cfg.Health)
++
++	created, err := scanIntegrationPublic(row)
++	if err != nil {
++		return domain.IntegrationConfig{}, err
++	}
++	_ = r.CreateIntegrationLog(ctx, created.ID, "create", created.Status, "integration configuration saved")
++	_ = r.CreateAuditLog(ctx, "system", "create", "integration", created.ID, "integration created: "+created.Name)
++	return created, nil
++}
++
++func (r *Repository) UpdateIntegration(ctx context.Context, cfg domain.IntegrationConfig) (domain.IntegrationConfig, error) {
++	row := r.pool.QueryRow(ctx, `
++		UPDATE integrations
++		SET name = $2,
++			category = $3,
++			endpoint_url = $4,
++			access_token_encrypted = $5,
++			username = $6,
++			password_encrypted = $7,
++			namespace = $8,
++			tls_verify = $9,
++			sync_interval_seconds = $10,
++			enabled = $11,
++			status = $12,
++			mode = $13,
++			last_health = $14,
++			last_sync_at = $15,
++			updated_at = now()
++		WHERE id = $1
++		RETURNING id, name, tool_type, category, endpoint_url, username, namespace, tls_verify,
++			sync_interval_seconds, enabled, status, mode, last_health, last_sync_at, created_at, updated_at,
++			access_token_encrypted <> '', password_encrypted <> ''`,
++		cfg.ID, cfg.Name, cfg.Category, cfg.EndpointURL, cfg.AccessToken, cfg.Username, cfg.Password, cfg.Namespace,
++		cfg.TLSVerify, cfg.SyncIntervalSeconds, cfg.Enabled, cfg.Status, cfg.Mode, cfg.Health, cfg.LastSyncAt)
++	updated, err := scanIntegrationPublic(row)
++	if err != nil {
++		return domain.IntegrationConfig{}, err
++	}
++	_ = r.CreateIntegrationLog(ctx, updated.ID, "update", updated.Status, "integration configuration updated")
++	_ = r.CreateAuditLog(ctx, "system", "update", "integration", updated.ID, "integration updated: "+updated.Name)
++	return updated, nil
++}
++
++func (r *Repository) DeleteIntegration(ctx context.Context, id string) error {
++	_, err := r.pool.Exec(ctx, `DELETE FROM integrations WHERE id = $1`, id)
++	if err == nil {
++		_ = r.CreateAuditLog(ctx, "system", "delete", "integration", id, "integration deleted")
++	}
++	return err
++}
++
++func (r *Repository) SetIntegrationEnabled(ctx context.Context, id string, enabled bool) (domain.IntegrationConfig, error) {
++	status := domain.IntegrationStatusDisabled
++	message := "integration disabled"
++	if enabled {
++		status = domain.IntegrationStatusUnknown
++		message = "integration enabled"
++	}
++	row := r.pool.QueryRow(ctx, `
++		UPDATE integrations
++		SET enabled = $2, status = $3, last_health = $4, updated_at = now()
++		WHERE id = $1
++		RETURNING id, name, tool_type, category, endpoint_url, username, namespace, tls_verify,
++			sync_interval_seconds, enabled, status, mode, last_health, last_sync_at, created_at, updated_at,
++			access_token_encrypted <> '', password_encrypted <> ''`, id, enabled, status, message)
++	updated, err := scanIntegrationPublic(row)
++	if err != nil {
++		return domain.IntegrationConfig{}, err
++	}
++	_ = r.CreateIntegrationLog(ctx, id, "set_enabled", status, message)
++	_ = r.CreateAuditLog(ctx, "system", "set_enabled", "integration", id, message)
++	return updated, nil
++}
++
++func (r *Repository) UpdateIntegrationHealth(ctx context.Context, id string, health domain.IntegrationHealth) (domain.IntegrationConfig, error) {
++	row := r.pool.QueryRow(ctx, `
++		UPDATE integrations
++		SET status = $2, last_health = $3, updated_at = now()
++		WHERE id = $1
++		RETURNING id, name, tool_type, category, endpoint_url, username, namespace, tls_verify,
++			sync_interval_seconds, enabled, status, mode, last_health, last_sync_at, created_at, updated_at,
++			access_token_encrypted <> '', password_encrypted <> ''`, id, health.Status, health.Message)
++	updated, err := scanIntegrationPublic(row)
++	if err != nil {
++		return domain.IntegrationConfig{}, err
++	}
++	_ = r.CreateIntegrationLog(ctx, id, "health", health.Status, health.Message)
++	return updated, nil
++}
++
++func (r *Repository) MarkIntegrationSynced(ctx context.Context, id string, sync domain.IntegrationSyncResult) (domain.IntegrationConfig, error) {
++	row := r.pool.QueryRow(ctx, `
++		UPDATE integrations
++		SET status = $2, last_health = $3, last_sync_at = $4, updated_at = now()
++		WHERE id = $1
++		RETURNING id, name, tool_type, category, endpoint_url, username, namespace, tls_verify,
++			sync_interval_seconds, enabled, status, mode, last_health, last_sync_at, created_at, updated_at,
++			access_token_encrypted <> '', password_encrypted <> ''`, id, sync.Status, sync.Message, sync.SyncedAt)
++	updated, err := scanIntegrationPublic(row)
++	if err != nil {
++		return domain.IntegrationConfig{}, err
++	}
++	_ = r.CreateIntegrationLog(ctx, id, "sync", sync.Status, sync.Message)
++	return updated, nil
++}
++
++func (r *Repository) CreateIntegrationLog(ctx context.Context, integrationID string, action string, status string, message string) error {
++	_, err := r.pool.Exec(ctx, `
++		INSERT INTO integration_logs (id, integration_id, action, status, message)
++		VALUES ($1, $2, $3, $4, $5)`, "ilog-"+randomHex(8), integrationID, action, status, message)
++	return err
++}
++
++func (r *Repository) ListIntegrationLogs(ctx context.Context, integrationID string) ([]domain.IntegrationLog, error) {
++	rows, err := r.pool.Query(ctx, `
++		SELECT id, integration_id, action, status, message, created_at
++		FROM integration_logs
++		WHERE integration_id = $1
++		ORDER BY created_at DESC
++		LIMIT 100`, integrationID)
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++
++	items := make([]domain.IntegrationLog, 0)
++	for rows.Next() {
++		var item domain.IntegrationLog
++		if err := rows.Scan(&item.ID, &item.IntegrationID, &item.Action, &item.Status, &item.Message, &item.CreatedAt); err != nil {
++			return nil, err
++		}
++		items = append(items, item)
++	}
++	return items, rows.Err()
++}
++
++func (r *Repository) CreateAuditLog(ctx context.Context, actor string, action string, resourceType string, resourceID string, message string) error {
++	_, err := r.pool.Exec(ctx, `
++		INSERT INTO audit_logs (id, actor, action, resource_type, resource_id, message)
++		VALUES ($1, $2, $3, $4, $5, $6)`, "audit-"+randomHex(8), actor, action, resourceType, resourceID, message)
++	return err
++}
++
++func (r *Repository) CreateObservabilitySignal(ctx context.Context, source string, signalType string, status string, message string) error {
++	_, err := r.pool.Exec(ctx, `
++		INSERT INTO observability_signals (id, source, signal_type, status, message)
++		VALUES ($1, $2, $3, $4, $5)`, "obs-"+randomHex(8), source, signalType, status, message)
++	return err
++}
++
++type integrationPublicScanner interface {
++	Scan(dest ...any) error
++}
++
++func scanIntegrationPublic(row integrationPublicScanner) (domain.IntegrationConfig, error) {
++	var item domain.IntegrationConfig
++	var lastSync stdsql.NullTime
++	if err := row.Scan(&item.ID, &item.Name, &item.Type, &item.Category, &item.EndpointURL, &item.Username, &item.Namespace,
++		&item.TLSVerify, &item.SyncIntervalSeconds, &item.Enabled, &item.Status, &item.Mode, &item.Health, &lastSync,
++		&item.CreatedAt, &item.UpdatedAt, &item.HasAccessToken, &item.HasPassword); err != nil {
++		return domain.IntegrationConfig{}, err
++	}
++	if lastSync.Valid {
++		item.LastSyncAt = &lastSync.Time
++	}
++	return item, nil
++}
++
++func scanIntegrationPrivate(row integrationPublicScanner) (domain.IntegrationConfig, error) {
++	var item domain.IntegrationConfig
++	var lastSync stdsql.NullTime
++	if err := row.Scan(&item.ID, &item.Name, &item.Type, &item.Category, &item.EndpointURL, &item.Username, &item.Namespace,
++		&item.TLSVerify, &item.SyncIntervalSeconds, &item.Enabled, &item.Status, &item.Mode, &item.Health, &lastSync,
++		&item.CreatedAt, &item.UpdatedAt, &item.HasAccessToken, &item.HasPassword, &item.AccessToken, &item.Password); err != nil {
++		return domain.IntegrationConfig{}, err
++	}
++	if lastSync.Valid {
++		item.LastSyncAt = &lastSync.Time
++	}
++	return item, nil
++}
+diff -ruN sentinelops_active_base/apps/api/internal/platform/database/seed.go sentinelops_prod/apps/api/internal/platform/database/seed.go
+--- sentinelops_active_base/apps/api/internal/platform/database/seed.go	2026-07-07 13:54:10.980088708 +0000
++++ sentinelops_prod/apps/api/internal/platform/database/seed.go	2026-07-07 15:17:03.762502497 +0000
+@@ -7,6 +7,16 @@
+ )
+ 
+ func Seed(ctx context.Context, pool *pgxpool.Pool) error {
++	if err := seedCorePlatformData(ctx, pool); err != nil {
++		return err
++	}
++	if err := seedIntegrationCatalog(ctx, pool); err != nil {
++		return err
++	}
++	return seedDefaultSettings(ctx, pool)
++}
++
++func seedCorePlatformData(ctx context.Context, pool *pgxpool.Pool) error {
+ 	var count int
+ 	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM applications`).Scan(&count); err != nil {
+ 		return err
+@@ -52,3 +62,37 @@
+ 	}
+ 	return nil
+ }
++
++func seedIntegrationCatalog(ctx context.Context, pool *pgxpool.Pool) error {
++	var count int
++	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM integrations`).Scan(&count); err != nil {
++		return err
++	}
++	if count > 0 {
++		return nil
++	}
++
++	_, err := pool.Exec(ctx, `INSERT INTO integrations
++		(id, name, tool_type, category, endpoint_url, namespace, tls_verify, sync_interval_seconds, enabled, status, mode, last_health)
++		VALUES
++		('int-prometheus', 'Prometheus', 'Prometheus', 'Observability', 'http://prometheus:9090', 'monitoring', true, 60, false, 'disabled', 'demo', 'Not enabled yet'),
++		('int-grafana', 'Grafana', 'Grafana', 'Observability', 'http://grafana:3000', 'monitoring', true, 60, false, 'disabled', 'demo', 'Not enabled yet'),
++		('int-harbor', 'Harbor', 'Harbor', 'Registry', 'http://harbor.local', 'registry', true, 300, false, 'disabled', 'demo', 'Not enabled yet'),
++		('int-argocd', 'Argo CD', 'ArgoCD', 'GitOps', 'http://argocd-server.argocd.svc.cluster.local', 'argocd', true, 60, false, 'disabled', 'demo', 'Not enabled yet'),
++		('int-vault', 'Vault/OpenBao', 'Vault', 'Secrets', 'http://vault:8200', 'vault', true, 300, false, 'disabled', 'demo', 'Not enabled yet'),
++		('int-github', 'GitHub', 'GitHub', 'SCM', 'https://api.github.com', '', true, 300, false, 'disabled', 'demo', 'Not enabled yet'),
++		('int-sonarqube', 'SonarQube', 'SonarQube', 'Code Quality', 'http://sonarqube:9000', 'quality', true, 300, false, 'disabled', 'demo', 'Not enabled yet'),
++		('int-wazuh', 'Wazuh', 'Wazuh', 'SIEM', 'http://wazuh-manager:55000', 'security', true, 300, false, 'disabled', 'demo', 'Not enabled yet'),
++		('int-falco', 'Falco', 'Falco', 'Runtime Security', 'http://falco-exporter:9376', 'security', true, 60, false, 'disabled', 'demo', 'Not enabled yet')
++		ON CONFLICT (id) DO NOTHING;`)
++	return err
++}
++
++func seedDefaultSettings(ctx context.Context, pool *pgxpool.Pool) error {
++	_, err := pool.Exec(ctx, `INSERT INTO settings (key, value) VALUES
++		('environment_mode', 'demo'),
++		('default_namespace', 'sentinelops'),
++		('audit_retention_days', '90')
++		ON CONFLICT (key) DO NOTHING;`)
++	return err
++}
+diff -ruN sentinelops_active_base/apps/api/internal/platform/http/router.go sentinelops_prod/apps/api/internal/platform/http/router.go
+--- sentinelops_active_base/apps/api/internal/platform/http/router.go	2026-07-07 15:14:06.688718584 +0000
++++ sentinelops_prod/apps/api/internal/platform/http/router.go	2026-07-07 15:18:53.323430963 +0000
+@@ -12,11 +12,12 @@
+ )
+ 
+ type Handler struct {
+-	overview *application.OverviewService
+-	modules  *application.ModuleService
++	overview     *application.OverviewService
++	modules      *application.ModuleService
++	integrations *application.IntegrationService
+ }
+ 
+-func NewRouter(cfg config.Config, overview *application.OverviewService, modules *application.ModuleService, authMiddleware *auth.Middleware) *gin.Engine {
++func NewRouter(cfg config.Config, overview *application.OverviewService, modules *application.ModuleService, integrations *application.IntegrationService, authMiddleware *auth.Middleware) *gin.Engine {
+ 	if cfg.AppEnv == "production" {
+ 		gin.SetMode(gin.ReleaseMode)
+ 	}
+@@ -32,7 +33,7 @@
+ 		AllowCredentials: true,
+ 	}))
+ 
+-	h := &Handler{overview: overview, modules: modules}
++	h := &Handler{overview: overview, modules: modules, integrations: integrations}
+ 
+ 	router.GET("/health", h.health)
+ 
+@@ -51,6 +52,14 @@
+ 		v1.PATCH("/security/alerts/:id/status", h.updateSecurityAlertStatus)
+ 		v1.GET("/observability/signals", h.listObservabilitySignals)
+ 		v1.GET("/integrations", h.listIntegrations)
++		v1.POST("/integrations", h.createIntegration)
++		v1.GET("/integrations/:id", h.getIntegration)
++		v1.PUT("/integrations/:id", h.updateIntegration)
++		v1.DELETE("/integrations/:id", h.deleteIntegration)
++		v1.PATCH("/integrations/:id/enabled", h.setIntegrationEnabled)
++		v1.POST("/integrations/:id/test", h.testIntegration)
++		v1.POST("/integrations/:id/sync", h.syncIntegration)
++		v1.GET("/integrations/:id/logs", h.listIntegrationLogs)
+ 		v1.GET("/registry/artifacts", h.listRegistryArtifacts)
+ 	}
+ 
+@@ -147,7 +156,71 @@
+ }
+ 
+ func (h *Handler) listIntegrations(c *gin.Context) {
+-	data, err := h.modules.ListIntegrations(c.Request.Context())
++	data, err := h.integrations.List(c.Request.Context())
++	respond(c, data, err)
++}
++
++func (h *Handler) getIntegration(c *gin.Context) {
++	data, err := h.integrations.Get(c.Request.Context(), c.Param("id"))
++	respond(c, data, err)
++}
++
++func (h *Handler) createIntegration(c *gin.Context) {
++	var req domain.CreateIntegrationRequest
++	if err := c.ShouldBindJSON(&req); err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++		return
++	}
++	data, err := h.integrations.Create(c.Request.Context(), req)
++	h.overview.Invalidate(c.Request.Context())
++	respondWithStatus(c, http.StatusCreated, data, err)
++}
++
++func (h *Handler) updateIntegration(c *gin.Context) {
++	var req domain.UpdateIntegrationRequest
++	if err := c.ShouldBindJSON(&req); err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++		return
++	}
++	data, err := h.integrations.Update(c.Request.Context(), c.Param("id"), req)
++	h.overview.Invalidate(c.Request.Context())
++	respond(c, data, err)
++}
++
++func (h *Handler) deleteIntegration(c *gin.Context) {
++	if err := h.integrations.Delete(c.Request.Context(), c.Param("id")); err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
++		return
++	}
++	h.overview.Invalidate(c.Request.Context())
++	c.Status(http.StatusNoContent)
++}
++
++func (h *Handler) setIntegrationEnabled(c *gin.Context) {
++	var req domain.SetIntegrationEnabledRequest
++	if err := c.ShouldBindJSON(&req); err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++		return
++	}
++	data, err := h.integrations.SetEnabled(c.Request.Context(), c.Param("id"), req)
++	h.overview.Invalidate(c.Request.Context())
++	respond(c, data, err)
++}
++
++func (h *Handler) testIntegration(c *gin.Context) {
++	data, err := h.integrations.TestConnection(c.Request.Context(), c.Param("id"))
++	h.overview.Invalidate(c.Request.Context())
++	respond(c, data, err)
++}
++
++func (h *Handler) syncIntegration(c *gin.Context) {
++	data, err := h.integrations.Sync(c.Request.Context(), c.Param("id"))
++	h.overview.Invalidate(c.Request.Context())
++	respond(c, data, err)
++}
++
++func (h *Handler) listIntegrationLogs(c *gin.Context) {
++	data, err := h.integrations.Logs(c.Request.Context(), c.Param("id"))
+ 	respond(c, data, err)
+ }
+ 
+diff -ruN sentinelops_active_base/apps/api/internal/platform/integrations/adapters.go sentinelops_prod/apps/api/internal/platform/integrations/adapters.go
+--- sentinelops_active_base/apps/api/internal/platform/integrations/adapters.go	1970-01-01 00:00:00.000000000 +0000
++++ sentinelops_prod/apps/api/internal/platform/integrations/adapters.go	2026-07-07 15:21:08.514575977 +0000
+@@ -0,0 +1,234 @@
++package integrations
++
++import (
++	"context"
++	"crypto/tls"
++	"errors"
++	"fmt"
++	"net/http"
++	"strings"
++	"time"
++
++	"github.com/sentinelops/sentinelops/apps/api/internal/domain"
++	"github.com/sentinelops/sentinelops/apps/api/internal/ports"
++)
++
++type Registry struct {
++	mode string
++}
++
++func NewRegistry(mode string) *Registry {
++	mode = strings.ToLower(strings.TrimSpace(mode))
++	if mode == "" {
++		mode = domain.IntegrationModeDemo
++	}
++	return &Registry{mode: mode}
++}
++
++func (r *Registry) For(ctx context.Context, cfg domain.IntegrationConfig) ports.Integration {
++	if r.mode == domain.IntegrationModeDemo || cfg.Mode == domain.IntegrationModeDemo {
++		return SimulatorAdapter{}
++	}
++	return HTTPAdapter{client: httpClient(cfg.TLSVerify)}
++}
++
++type SimulatorAdapter struct{}
++
++func (SimulatorAdapter) Connect(ctx context.Context, cfg domain.IntegrationConfig) error {
++	if !cfg.Enabled {
++		return fmt.Errorf("integration is disabled")
++	}
++	return nil
++}
++
++func (SimulatorAdapter) Health(ctx context.Context, cfg domain.IntegrationConfig) (domain.IntegrationHealth, error) {
++	if !cfg.Enabled {
++		return domain.IntegrationHealth{
++			Status:    domain.IntegrationStatusDisabled,
++			Healthy:   false,
++			Message:   "integration is disabled",
++			CheckedAt: time.Now().UTC(),
++		}, nil
++	}
++	return domain.IntegrationHealth{
++		Status:    domain.IntegrationStatusConnected,
++		Healthy:   true,
++		Message:   fmt.Sprintf("%s simulator adapter is reachable in demo mode", cfg.Type),
++		CheckedAt: time.Now().UTC(),
++		Attributes: map[string]string{
++			"mode":      domain.IntegrationModeDemo,
++			"namespace": cfg.Namespace,
++		},
++	}, nil
++}
++
++func (SimulatorAdapter) Sync(ctx context.Context, cfg domain.IntegrationConfig) (domain.IntegrationSyncResult, error) {
++	if !cfg.Enabled {
++		return domain.IntegrationSyncResult{
++			Status:   domain.IntegrationStatusDisabled,
++			Message:  "integration is disabled",
++			SyncedAt: time.Now().UTC(),
++		}, nil
++	}
++	return domain.IntegrationSyncResult{
++		Status:   domain.IntegrationStatusConnected,
++		Message:  fmt.Sprintf("%s simulator sync completed", cfg.Type),
++		SyncedAt: time.Now().UTC(),
++		Resources: map[string]int{
++			"metrics":  3,
++			"events":   1,
++			"findings": 0,
++		},
++		Metadata: map[string]string{
++			"adapter": "simulator",
++			"mode":    domain.IntegrationModeDemo,
++		},
++	}, nil
++}
++
++func (SimulatorAdapter) Status(ctx context.Context, cfg domain.IntegrationConfig) (string, error) {
++	if !cfg.Enabled {
++		return domain.IntegrationStatusDisabled, nil
++	}
++	return domain.IntegrationStatusConnected, nil
++}
++
++func (SimulatorAdapter) Configuration(ctx context.Context, cfg domain.IntegrationConfig) (map[string]string, error) {
++	return map[string]string{
++		"endpointUrl": cfg.EndpointURL,
++		"namespace":   cfg.Namespace,
++		"tlsVerify":   fmt.Sprintf("%t", cfg.TLSVerify),
++		"mode":        domain.IntegrationModeDemo,
++	}, nil
++}
++
++type HTTPAdapter struct {
++	client *http.Client
++}
++
++func (a HTTPAdapter) Connect(ctx context.Context, cfg domain.IntegrationConfig) error {
++	result, err := a.Health(ctx, cfg)
++	if err != nil {
++		return err
++	}
++	if !result.Healthy {
++		return errors.New(result.Message)
++	}
++	return nil
++}
++
++func (a HTTPAdapter) Health(ctx context.Context, cfg domain.IntegrationConfig) (domain.IntegrationHealth, error) {
++	if !cfg.Enabled {
++		return domain.IntegrationHealth{
++			Status:    domain.IntegrationStatusDisabled,
++			Healthy:   false,
++			Message:   "integration is disabled",
++			CheckedAt: time.Now().UTC(),
++		}, nil
++	}
++
++	url := healthURL(cfg)
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
++	if err != nil {
++		return domain.IntegrationHealth{}, err
++	}
++	if cfg.AccessToken != "" {
++		req.Header.Set("Authorization", "Bearer "+cfg.AccessToken)
++	}
++	if cfg.Username != "" && cfg.Password != "" {
++		req.SetBasicAuth(cfg.Username, cfg.Password)
++	}
++
++	resp, err := a.client.Do(req)
++	if err != nil {
++		return domain.IntegrationHealth{
++			Status:    domain.IntegrationStatusDisconnected,
++			Healthy:   false,
++			Message:   err.Error(),
++			CheckedAt: time.Now().UTC(),
++		}, nil
++	}
++	defer resp.Body.Close()
++
++	healthy := resp.StatusCode >= 200 && resp.StatusCode < 400
++	status := domain.IntegrationStatusConnected
++	if !healthy {
++		status = domain.IntegrationStatusError
++	}
++	return domain.IntegrationHealth{
++		Status:    status,
++		Healthy:   healthy,
++		Message:   fmt.Sprintf("%s responded with HTTP %d", url, resp.StatusCode),
++		CheckedAt: time.Now().UTC(),
++		Attributes: map[string]string{
++			"statusCode": fmt.Sprintf("%d", resp.StatusCode),
++			"adapter":    "http",
++		},
++	}, nil
++}
++
++func (a HTTPAdapter) Sync(ctx context.Context, cfg domain.IntegrationConfig) (domain.IntegrationSyncResult, error) {
++	health, err := a.Health(ctx, cfg)
++	if err != nil {
++		return domain.IntegrationSyncResult{}, err
++	}
++	return domain.IntegrationSyncResult{
++		Status:   health.Status,
++		Message:  "health data synchronized from integration endpoint",
++		SyncedAt: time.Now().UTC(),
++		Resources: map[string]int{
++			"health_checks": 1,
++		},
++		Metadata: health.Attributes,
++	}, nil
++}
++
++func (a HTTPAdapter) Status(ctx context.Context, cfg domain.IntegrationConfig) (string, error) {
++	health, err := a.Health(ctx, cfg)
++	if err != nil {
++		return domain.IntegrationStatusError, err
++	}
++	return health.Status, nil
++}
++
++func (a HTTPAdapter) Configuration(ctx context.Context, cfg domain.IntegrationConfig) (map[string]string, error) {
++	return map[string]string{
++		"endpointUrl": cfg.EndpointURL,
++		"namespace":   cfg.Namespace,
++		"tlsVerify":   fmt.Sprintf("%t", cfg.TLSVerify),
++		"adapter":     "http",
++	}, nil
++}
++
++func httpClient(tlsVerify bool) *http.Client {
++	transport := &http.Transport{
++		TLSClientConfig: &tls.Config{InsecureSkipVerify: !tlsVerify}, //nolint:gosec -- user-controlled lab setting.
++	}
++	return &http.Client{Timeout: 8 * time.Second, Transport: transport}
++}
++
++func healthURL(cfg domain.IntegrationConfig) string {
++	base := strings.TrimRight(cfg.EndpointURL, "/")
++	switch cfg.Type {
++	case "Prometheus":
++		return base + "/-/healthy"
++	case "Grafana":
++		return base + "/api/health"
++	case "Harbor":
++		return base + "/api/v2.0/health"
++	case "ArgoCD":
++		return base + "/api/version"
++	case "Loki":
++		return base + "/ready"
++	case "Tempo":
++		return base + "/ready"
++	case "Vault":
++		return base + "/v1/sys/health"
++	case "SonarQube":
++		return base + "/api/system/health"
++	case "Keycloak":
++		return base + "/realms/master"
++	default:
++		return base
++	}
++}
+diff -ruN sentinelops_active_base/apps/api/internal/ports/integration.go sentinelops_prod/apps/api/internal/ports/integration.go
+--- sentinelops_active_base/apps/api/internal/ports/integration.go	1970-01-01 00:00:00.000000000 +0000
++++ sentinelops_prod/apps/api/internal/ports/integration.go	2026-07-07 15:15:42.663512983 +0000
+@@ -0,0 +1,19 @@
++package ports
++
++import (
++	"context"
++
++	"github.com/sentinelops/sentinelops/apps/api/internal/domain"
++)
++
++type Integration interface {
++	Connect(ctx context.Context, cfg domain.IntegrationConfig) error
++	Health(ctx context.Context, cfg domain.IntegrationConfig) (domain.IntegrationHealth, error)
++	Sync(ctx context.Context, cfg domain.IntegrationConfig) (domain.IntegrationSyncResult, error)
++	Status(ctx context.Context, cfg domain.IntegrationConfig) (string, error)
++	Configuration(ctx context.Context, cfg domain.IntegrationConfig) (map[string]string, error)
++}
++
++type IntegrationRegistry interface {
++	For(ctx context.Context, cfg domain.IntegrationConfig) Integration
++}
+diff -ruN sentinelops_active_base/apps/web/app/settings/page.tsx sentinelops_prod/apps/web/app/settings/page.tsx
+--- sentinelops_active_base/apps/web/app/settings/page.tsx	2026-07-07 13:57:00.672924167 +0000
++++ sentinelops_prod/apps/web/app/settings/page.tsx	2026-07-07 15:20:08.969427631 +0000
+@@ -1,31 +1,331 @@
+-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
++'use client';
++
++import { useMemo, useState } from 'react';
++import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
++import { api, type IntegrationPayload } from '@/lib/api';
++import type { Integration, IntegrationLog } from '@/lib/types';
++import { StatusDot } from '@/components/dashboard/status-dot';
++import { ErrorState } from '@/components/dashboard/error-state';
++import { LoadingState } from '@/components/dashboard/loading-state';
+ import { Badge } from '@/components/ui/badge';
++import { Button } from '@/components/ui/button';
++import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+ 
+-const settings = [
+-  ['Authentication', 'Keycloak/OIDC boundary is present. Local development auth is disabled by default.'],
+-  ['GitOps', 'Argo CD application manifest is available under gitops/argocd.'],
+-  ['Policy', 'OPA Gatekeeper is represented as an integration and can be installed through cluster addons.'],
+-  ['Secrets', 'Vault/OpenBao is the intended backend for dynamic secrets and audit logs.'],
+-  ['Security Scanning', 'CI workflow includes scanner stages for Trivy, Semgrep, and Gitleaks.']
++const toolTypes = [
++  'Prometheus',
++  'Grafana',
++  'Harbor',
++  'Vault',
++  'GitHub',
++  'GitHubActions',
++  'ArgoCD',
++  'Kubernetes',
++  'Loki',
++  'Tempo',
++  'SonarQube',
++  'Trivy',
++  'Semgrep',
++  'Gitleaks',
++  'Falco',
++  'Wazuh',
++  'Keycloak',
++  'OPA-Gatekeeper'
+ ];
+ 
++const emptyForm: IntegrationPayload = {
++  name: '',
++  type: 'Prometheus',
++  category: '',
++  endpointUrl: 'http://localhost:9090',
++  accessToken: '',
++  username: '',
++  password: '',
++  namespace: '',
++  tlsVerify: true,
++  syncIntervalSeconds: 60,
++  enabled: true
++};
++
++function badgeVariant(status: string): 'success' | 'warning' | 'danger' | 'muted' {
++  if (status === 'connected' || status === 'healthy') return 'success';
++  if (status === 'error' || status === 'disconnected') return 'danger';
++  if (status === 'disabled') return 'muted';
++  return 'warning';
++}
++
++function toForm(item: Integration): IntegrationPayload {
++  return {
++    name: item.name,
++    type: item.type,
++    category: item.category,
++    endpointUrl: item.endpointUrl,
++    accessToken: '',
++    username: item.username ?? '',
++    password: '',
++    namespace: item.namespace ?? '',
++    tlsVerify: item.tlsVerify,
++    syncIntervalSeconds: item.syncIntervalSeconds,
++    enabled: item.enabled
++  };
++}
++
+ export default function SettingsPage() {
++  const queryClient = useQueryClient();
++  const [selected, setSelected] = useState<Integration | null>(null);
++  const [form, setForm] = useState<IntegrationPayload>(emptyForm);
++  const [feedback, setFeedback] = useState<string>('');
++
++  const integrations = useQuery({ queryKey: ['integrations'], queryFn: api.integrations });
++  const logs = useQuery({
++    queryKey: ['integration-logs', selected?.id],
++    queryFn: () => api.integrationLogs(selected!.id),
++    enabled: Boolean(selected?.id)
++  });
++
++  const invalidate = async () => {
++    await Promise.all([
++      queryClient.invalidateQueries({ queryKey: ['integrations'] }),
++      queryClient.invalidateQueries({ queryKey: ['overview'] }),
++      queryClient.invalidateQueries({ queryKey: ['integration-logs'] })
++    ]);
++  };
++
++  const createMutation = useMutation({
++    mutationFn: api.createIntegration,
++    onSuccess: async (created) => {
++      setFeedback(`Saved ${created.name}`);
++      setSelected(created);
++      setForm(toForm(created));
++      await invalidate();
++    },
++    onError: (error: Error) => setFeedback(error.message)
++  });
++
++  const updateMutation = useMutation({
++    mutationFn: ({ id, body }: { id: string; body: Partial<IntegrationPayload> }) => api.updateIntegration(id, body),
++    onSuccess: async (updated) => {
++      setFeedback(`Updated ${updated.name}`);
++      setSelected(updated);
++      setForm(toForm(updated));
++      await invalidate();
++    },
++    onError: (error: Error) => setFeedback(error.message)
++  });
++
++  const deleteMutation = useMutation({
++    mutationFn: api.deleteIntegration,
++    onSuccess: async () => {
++      setFeedback('Integration deleted');
++      setSelected(null);
++      setForm(emptyForm);
++      await invalidate();
++    },
++    onError: (error: Error) => setFeedback(error.message)
++  });
++
++  const enableMutation = useMutation({
++    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => api.setIntegrationEnabled(id, enabled),
++    onSuccess: async (updated) => {
++      setFeedback(`${updated.name} is now ${updated.enabled ? 'enabled' : 'disabled'}`);
++      setSelected(updated);
++      setForm(toForm(updated));
++      await invalidate();
++    },
++    onError: (error: Error) => setFeedback(error.message)
++  });
++
++  const testMutation = useMutation({
++    mutationFn: api.testIntegration,
++    onSuccess: async (result) => {
++      setFeedback(`Connection test: ${result.status} — ${result.message}`);
++      await invalidate();
++    },
++    onError: (error: Error) => setFeedback(error.message)
++  });
++
++  const syncMutation = useMutation({
++    mutationFn: api.syncIntegration,
++    onSuccess: async (result) => {
++      setFeedback(`Sync complete: ${result.status} — ${result.message}`);
++      await invalidate();
++    },
++    onError: (error: Error) => setFeedback(error.message)
++  });
++
++  const isBusy = createMutation.isPending || updateMutation.isPending || deleteMutation.isPending || enableMutation.isPending || testMutation.isPending || syncMutation.isPending;
++
++  const integrationList = useMemo(() => integrations.data ?? [], [integrations.data]);
++
++  if (integrations.isLoading) return <LoadingState label="Loading platform settings..." />;
++  if (integrations.error) return <ErrorState message="Unable to load integrations from the SentinelOps API." />;
++
++  const submit = () => {
++    setFeedback('');
++    const body: IntegrationPayload = {
++      ...form,
++      syncIntervalSeconds: Number(form.syncIntervalSeconds || 60)
++    };
++    if (selected) {
++      const payload: Partial<IntegrationPayload> = { ...body };
++      if (!payload.accessToken) delete payload.accessToken;
++      if (!payload.password) delete payload.password;
++      updateMutation.mutate({ id: selected.id, body: payload });
++    } else {
++      createMutation.mutate(body);
++    }
++  };
++
++  const selectIntegration = (item: Integration) => {
++    setSelected(item);
++    setForm(toForm(item));
++    setFeedback('');
++  };
++
++  const resetForm = () => {
++    setSelected(null);
++    setForm(emptyForm);
++    setFeedback('');
++  };
++
+   return (
+-    <Card>
+-      <CardHeader>
+-        <CardTitle>Platform Settings</CardTitle>
+-      </CardHeader>
+-      <CardContent className="space-y-3">
+-        {settings.map(([name, description]) => (
+-          <div key={name} className="rounded-xl border border-slate-800 bg-slate-900/70 p-4">
+-            <div className="mb-2 flex items-center justify-between">
+-              <div className="font-medium text-slate-100">{name}</div>
+-              <Badge variant="success">configured</Badge>
++    <div className="space-y-6">
++      <section className="grid gap-4 xl:grid-cols-[1.2fr_0.8fr]">
++        <Card>
++          <CardHeader className="flex-row items-center justify-between space-y-0">
++            <CardTitle>Integrations</CardTitle>
++            <Badge variant="muted">stored in PostgreSQL</Badge>
++          </CardHeader>
++          <CardContent className="space-y-3">
++            {integrationList.map((item) => (
++              <button
++                key={item.id}
++                type="button"
++                onClick={() => selectIntegration(item)}
++                className="w-full rounded-xl border border-slate-800 bg-slate-900/70 p-4 text-left transition hover:border-cyan-400/40 hover:bg-slate-900"
++              >
++                <div className="mb-2 flex items-start justify-between gap-4">
++                  <div>
++                    <div className="flex items-center gap-2 font-medium text-slate-100">
++                      <StatusDot status={item.status} />
++                      {item.name}
++                    </div>
++                    <div className="mt-1 text-xs text-slate-500">{item.type} • {item.category} • {item.mode}</div>
++                  </div>
++                  <div className="flex items-center gap-2">
++                    <Badge variant={badgeVariant(item.status)}>{item.status}</Badge>
++                    <Badge variant={item.enabled ? 'success' : 'muted'}>{item.enabled ? 'enabled' : 'disabled'}</Badge>
++                  </div>
++                </div>
++                <div className="truncate text-xs text-slate-400">{item.endpointUrl}</div>
++                <div className="mt-2 text-xs text-slate-500">
++                  Last sync: {item.lastSyncAt ? new Date(item.lastSyncAt).toLocaleString() : 'never'} • Token: {item.hasAccessToken ? 'encrypted' : 'not set'}
++                </div>
++              </button>
++            ))}
++          </CardContent>
++        </Card>
++
++        <Card>
++          <CardHeader>
++            <CardTitle>{selected ? `Edit ${selected.name}` : 'Add Integration'}</CardTitle>
++          </CardHeader>
++          <CardContent className="space-y-3">
++            <Field label="Name" value={form.name} onChange={(value) => setForm({ ...form, name: value })} placeholder="Prometheus Production" />
++            <label className="block text-xs font-medium text-slate-400">
++              Type
++              <select
++                className="mt-1 w-full rounded-xl border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-cyan-400/50"
++                value={form.type}
++                onChange={(event) => setForm({ ...form, type: event.target.value })}
++              >
++                {toolTypes.map((tool) => <option key={tool} value={tool}>{tool}</option>)}
++              </select>
++            </label>
++            <Field label="Category" value={form.category ?? ''} onChange={(value) => setForm({ ...form, category: value })} placeholder="Observability" />
++            <Field label="Endpoint URL" value={form.endpointUrl} onChange={(value) => setForm({ ...form, endpointUrl: value })} placeholder="http://prometheus:9090" />
++            <Field label="Access Token" value={form.accessToken ?? ''} onChange={(value) => setForm({ ...form, accessToken: value })} placeholder={selected?.hasAccessToken ? 'leave empty to keep encrypted token' : 'optional'} type="password" />
++            <div className="grid gap-3 md:grid-cols-2">
++              <Field label="Username" value={form.username ?? ''} onChange={(value) => setForm({ ...form, username: value })} placeholder="optional" />
++              <Field label="Password" value={form.password ?? ''} onChange={(value) => setForm({ ...form, password: value })} placeholder={selected?.hasPassword ? 'leave empty to keep encrypted password' : 'optional'} type="password" />
++            </div>
++            <div className="grid gap-3 md:grid-cols-2">
++              <Field label="Namespace" value={form.namespace ?? ''} onChange={(value) => setForm({ ...form, namespace: value })} placeholder="monitoring" />
++              <Field label="Sync Interval Seconds" value={String(form.syncIntervalSeconds)} onChange={(value) => setForm({ ...form, syncIntervalSeconds: Number(value) })} type="number" />
+             </div>
+-            <p className="text-sm text-slate-500">{description}</p>
+-          </div>
+-        ))}
+-      </CardContent>
+-    </Card>
++            <div className="flex items-center justify-between rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 text-sm text-slate-300">
++              <label className="flex items-center gap-2">
++                <input type="checkbox" checked={form.tlsVerify} onChange={(event) => setForm({ ...form, tlsVerify: event.target.checked })} />
++                TLS verify
++              </label>
++              <label className="flex items-center gap-2">
++                <input type="checkbox" checked={form.enabled} onChange={(event) => setForm({ ...form, enabled: event.target.checked })} />
++                Enabled
++              </label>
++            </div>
++            <div className="flex flex-wrap gap-2">
++              <Button disabled={isBusy} onClick={submit}>{selected ? 'Save Changes' : 'Add Integration'}</Button>
++              <Button disabled={isBusy} className="border-slate-700 bg-slate-900 text-slate-200" onClick={resetForm}>New</Button>
++              {selected ? <Button disabled={isBusy} className="border-rose-400/30 bg-rose-400/10 text-rose-100" onClick={() => deleteMutation.mutate(selected.id)}>Delete</Button> : null}
++            </div>
++            {feedback ? <div className="rounded-xl border border-cyan-400/20 bg-cyan-400/10 p-3 text-xs text-cyan-100">{feedback}</div> : null}
++          </CardContent>
++        </Card>
++      </section>
++
++      {selected ? (
++        <section className="grid gap-4 xl:grid-cols-[0.8fr_1.2fr]">
++          <Card>
++            <CardHeader>
++              <CardTitle>Actions</CardTitle>
++            </CardHeader>
++            <CardContent className="space-y-3">
++              <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4">
++                <div className="mb-2 font-medium text-slate-100">{selected.name}</div>
++                <div className="text-xs leading-5 text-slate-500">{selected.health || 'No health check has been executed.'}</div>
++              </div>
++              <div className="grid gap-2 md:grid-cols-2">
++                <Button disabled={isBusy} onClick={() => enableMutation.mutate({ id: selected.id, enabled: !selected.enabled })}>{selected.enabled ? 'Disable' : 'Enable'}</Button>
++                <Button disabled={isBusy || !selected.enabled} onClick={() => testMutation.mutate(selected.id)}>Test Connection</Button>
++                <Button disabled={isBusy || !selected.enabled} onClick={() => syncMutation.mutate(selected.id)}>Sync Data</Button>
++              </div>
++            </CardContent>
++          </Card>
++
++          <Card>
++            <CardHeader>
++              <CardTitle>Integration Logs</CardTitle>
++            </CardHeader>
++            <CardContent className="space-y-3">
++              {(logs.data ?? []).map((log: IntegrationLog) => (
++                <div key={log.id} className="rounded-xl border border-slate-800 bg-slate-900/70 p-3">
++                  <div className="mb-1 flex items-center justify-between gap-3">
++                    <div className="flex items-center gap-2 text-sm font-medium text-slate-200"><StatusDot status={log.status} />{log.action}</div>
++                    <Badge variant={badgeVariant(log.status)}>{log.status}</Badge>
++                  </div>
++                  <div className="text-xs text-slate-500">{log.message}</div>
++                  <div className="mt-1 text-[11px] text-slate-600">{new Date(log.createdAt).toLocaleString()}</div>
++                </div>
++              ))}
++              {!logs.data?.length ? <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 text-sm text-slate-500">No logs yet. Run a test connection or sync.</div> : null}
++            </CardContent>
++          </Card>
++        </section>
++      ) : null}
++    </div>
++  );
++}
++
++function Field({ label, value, onChange, placeholder, type = 'text' }: { label: string; value: string; onChange: (value: string) => void; placeholder?: string; type?: string }) {
++  return (
++    <label className="block text-xs font-medium text-slate-400">
++      {label}
++      <input
++        type={type}
++        value={value}
++        onChange={(event) => onChange(event.target.value)}
++        placeholder={placeholder}
++        className="mt-1 w-full rounded-xl border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-cyan-400/50"
++      />
++    </label>
+   );
+ }
+diff -ruN sentinelops_active_base/apps/web/components/dashboard/integrations-card.tsx sentinelops_prod/apps/web/components/dashboard/integrations-card.tsx
+--- sentinelops_active_base/apps/web/components/dashboard/integrations-card.tsx	2026-07-07 13:56:24.759284240 +0000
++++ sentinelops_prod/apps/web/components/dashboard/integrations-card.tsx	2026-07-07 15:19:31.566472243 +0000
+@@ -3,9 +3,9 @@
+ import { Badge } from '@/components/ui/badge';
+ 
+ function variant(status: string): 'success' | 'warning' | 'danger' | 'muted' {
+-  if (status === 'healthy') return 'success';
++  if (status === 'healthy' || status === 'connected') return 'success';
+   if (status === 'warning' || status === 'degraded') return 'warning';
+-  if (status === 'failed') return 'danger';
++  if (status === 'failed' || status === 'error' || status === 'disconnected') return 'danger';
+   return 'muted';
+ }
+ 
+@@ -17,13 +17,13 @@
+       </CardHeader>
+       <CardContent className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+         {integrations.map((item) => (
+-          <div key={item.name} className="rounded-xl border border-slate-800 bg-slate-900/70 p-4">
++          <div key={item.id} className="rounded-xl border border-slate-800 bg-slate-900/70 p-4">
+             <div className="mb-2 flex items-center justify-between gap-2">
+               <div className="font-medium text-slate-100">{item.name}</div>
+               <Badge variant={variant(item.status)}>{item.status}</Badge>
+             </div>
+             <div className="text-xs text-slate-500">{item.category}</div>
+-            <div className="mt-2 truncate text-xs text-slate-400">{item.endpoint}</div>
++            <div className="mt-2 truncate text-xs text-slate-400">{item.endpointUrl}</div>
+           </div>
+         ))}
+       </CardContent>
+diff -ruN sentinelops_active_base/apps/web/components/dashboard/status-dot.tsx sentinelops_prod/apps/web/components/dashboard/status-dot.tsx
+--- sentinelops_active_base/apps/web/components/dashboard/status-dot.tsx	2026-07-07 13:56:13.495223643 +0000
++++ sentinelops_prod/apps/web/components/dashboard/status-dot.tsx	2026-07-07 15:20:16.814737951 +0000
+@@ -15,7 +15,12 @@
+   low: 'bg-sky-400',
+   open: 'bg-rose-400',
+   resolved: 'bg-emerald-400',
+-  triaged: 'bg-amber-400'
++  triaged: 'bg-amber-400',
++  connected: 'bg-emerald-400',
++  disabled: 'bg-slate-500',
++  disconnected: 'bg-rose-400',
++  error: 'bg-rose-400',
++  unknown: 'bg-amber-400'
+ };
+ 
+ export function StatusDot({ status }: { status: string }) {
+diff -ruN sentinelops_active_base/apps/web/lib/api.ts sentinelops_prod/apps/web/lib/api.ts
+--- sentinelops_active_base/apps/web/lib/api.ts	2026-07-07 15:14:06.690175145 +0000
++++ sentinelops_prod/apps/web/lib/api.ts	2026-07-07 15:19:22.826971704 +0000
+@@ -2,6 +2,9 @@
+   Application,
+   Deployment,
+   Integration,
++  IntegrationHealth,
++  IntegrationLog,
++  IntegrationSyncResult,
+   ObservabilitySignal,
+   Overview,
+   PipelineRun,
+@@ -26,17 +29,43 @@
+     throw new Error(text || `Request failed: ${response.status}`);
+   }
+ 
++  if (response.status === 204) {
++    return undefined as T;
++  }
++
+   return response.json() as Promise<T>;
+ }
+ 
+-function post<T>(path: string, body: unknown): Promise<T> {
+-  return request<T>(path, { method: 'POST', body: JSON.stringify(body) });
++function post<T>(path: string, body?: unknown): Promise<T> {
++  return request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) });
++}
++
++function put<T>(path: string, body: unknown): Promise<T> {
++  return request<T>(path, { method: 'PUT', body: JSON.stringify(body) });
+ }
+ 
+ function patch<T>(path: string, body: unknown): Promise<T> {
+   return request<T>(path, { method: 'PATCH', body: JSON.stringify(body) });
+ }
+ 
++function del(path: string): Promise<void> {
++  return request<void>(path, { method: 'DELETE' });
++}
++
++export type IntegrationPayload = {
++  name: string;
++  type: string;
++  category?: string;
++  endpointUrl: string;
++  accessToken?: string;
++  username?: string;
++  password?: string;
++  namespace?: string;
++  tlsVerify: boolean;
++  syncIntervalSeconds: number;
++  enabled: boolean;
++};
++
+ export const api = {
+   overview: () => request<Overview>('/overview'),
+   applications: () => request<Application[]>('/applications'),
+@@ -50,5 +79,12 @@
+   updateAlertStatus: (id: string, status: 'open' | 'triaged' | 'resolved') => patch<SecurityAlert>(`/security/alerts/${id}/status`, { status }),
+   signals: () => request<ObservabilitySignal[]>('/observability/signals'),
+   integrations: () => request<Integration[]>('/integrations'),
++  createIntegration: (body: IntegrationPayload) => post<Integration>('/integrations', body),
++  updateIntegration: (id: string, body: Partial<IntegrationPayload>) => put<Integration>(`/integrations/${id}`, body),
++  deleteIntegration: (id: string) => del(`/integrations/${id}`),
++  setIntegrationEnabled: (id: string, enabled: boolean) => patch<Integration>(`/integrations/${id}/enabled`, { enabled }),
++  testIntegration: (id: string) => post<IntegrationHealth>(`/integrations/${id}/test`),
++  syncIntegration: (id: string) => post<IntegrationSyncResult>(`/integrations/${id}/sync`),
++  integrationLogs: (id: string) => request<IntegrationLog[]>(`/integrations/${id}/logs`),
+   registryArtifacts: () => request<RegistryArtifact[]>('/registry/artifacts')
+ };
+diff -ruN sentinelops_active_base/apps/web/lib/types.ts sentinelops_prod/apps/web/lib/types.ts
+--- sentinelops_active_base/apps/web/lib/types.ts	2026-07-07 15:14:06.690403654 +0000
++++ sentinelops_prod/apps/web/lib/types.ts	2026-07-07 15:19:22.813124576 +0000
+@@ -53,10 +53,49 @@
+ };
+ 
+ export type Integration = {
++  id: string;
+   name: string;
++  type: string;
+   category: string;
++  endpointUrl: string;
++  username?: string;
++  namespace?: string;
++  tlsVerify: boolean;
++  syncIntervalSeconds: number;
++  enabled: boolean;
+   status: string;
+-  endpoint: string;
++  mode: string;
++  health: string;
++  lastSyncAt?: string;
++  createdAt: string;
++  updatedAt: string;
++  hasAccessToken: boolean;
++  hasPassword: boolean;
++};
++
++export type IntegrationLog = {
++  id: string;
++  integrationId: string;
++  action: string;
++  status: string;
++  message: string;
++  createdAt: string;
++};
++
++export type IntegrationHealth = {
++  status: string;
++  healthy: boolean;
++  message: string;
++  checkedAt: string;
++  attributes?: Record<string, string>;
++};
++
++export type IntegrationSyncResult = {
++  status: string;
++  message: string;
++  syncedAt: string;
++  resources?: Record<string, number>;
++  metadata?: Record<string, string>;
+ };
+ 
+ export type RegistryArtifact = {
+diff -ruN sentinelops_active_base/docker-compose.yml sentinelops_prod/docker-compose.yml
+--- sentinelops_active_base/docker-compose.yml	2026-07-07 13:53:28.557031352 +0000
++++ sentinelops_prod/docker-compose.yml	2026-07-07 15:20:24.515150464 +0000
+@@ -41,6 +41,8 @@
+       AUTH_ENABLED: ${AUTH_ENABLED:-false}
+       KEYCLOAK_ISSUER_URL: ${KEYCLOAK_ISSUER_URL:-http://keycloak:8080/realms/sentinelops}
+       KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-sentinelops-web}
++      PLATFORM_MODE: ${PLATFORM_MODE:-demo}
++      INTEGRATION_ENCRYPTION_KEY: ${INTEGRATION_ENCRYPTION_KEY:-sentinelops-local-dev-key-change-me}
+     ports:
+       - "8080:8080"
+     depends_on:
+diff -ruN sentinelops_active_base/docs/api.md sentinelops_prod/docs/api.md
+--- sentinelops_active_base/docs/api.md	2026-07-07 13:57:48.744215716 +0000
++++ sentinelops_prod/docs/api.md	2026-07-07 15:21:24.670620540 +0000
+@@ -88,3 +88,43 @@
+ ```
+ 
+ Returns integration health for Argo CD, Harbor, Vault/OpenBao, Prometheus, Grafana, Loki, Tempo, Alloy, Falco, Wazuh, and Gatekeeper.
++
++## Settings and Integrations API
++
++SentinelOps treats the backend as an API gateway and integration hub. Integration credentials are encrypted before being persisted to PostgreSQL.
++
++| Method | Path | Purpose |
++|---|---|---|
++| GET | `/api/v1/integrations` | List stored integration configurations without secret values. |
++| POST | `/api/v1/integrations` | Add a new integration configuration. `accessToken` and `password` are encrypted server-side. |
++| GET | `/api/v1/integrations/{id}` | Read one integration configuration. Secret values are never returned. |
++| PUT | `/api/v1/integrations/{id}` | Edit an integration. Empty `accessToken` or `password` keeps the existing encrypted value. |
++| DELETE | `/api/v1/integrations/{id}` | Delete an integration and cascade integration logs. |
++| PATCH | `/api/v1/integrations/{id}/enabled` | Enable or disable an integration. |
++| POST | `/api/v1/integrations/{id}/test` | Execute the selected adapter health check. |
++| POST | `/api/v1/integrations/{id}/sync` | Execute adapter sync and write integration logs plus observability signal. |
++| GET | `/api/v1/integrations/{id}/logs` | Return health, sync, update, and lifecycle logs for an integration. |
++
++### Create Integration Example
++
++```bash
++curl -X POST http://localhost:8080/api/v1/integrations \
++  -H 'Content-Type: application/json' \
++  -d '{
++    "name":"Prometheus Local",
++    "type":"Prometheus",
++    "category":"Observability",
++    "endpointUrl":"http://prometheus:9090",
++    "namespace":"monitoring",
++    "tlsVerify":true,
++    "syncIntervalSeconds":60,
++    "enabled":true
++  }'
++```
++
++### Environment Modes
++
++- `PLATFORM_MODE=demo`: uses simulator adapters; useful for demos and offline classroom environments.
++- `PLATFORM_MODE=lab`: uses HTTP adapters against Docker Compose or lab service endpoints.
++- `PLATFORM_MODE=production`: uses HTTP adapters against real production endpoints.
++
+diff -ruN sentinelops_active_base/docs/architecture.md sentinelops_prod/docs/architecture.md
+--- sentinelops_active_base/docs/architecture.md	2026-07-07 13:57:48.737467275 +0000
++++ sentinelops_prod/docs/architecture.md	2026-07-07 15:21:24.680854542 +0000
+@@ -102,3 +102,24 @@
+ - Add event ingestion through Kafka or NATS if polling becomes insufficient.
+ - Add tenant boundaries and organization-level RBAC.
+ - Add audit logging for every state-changing action.
++
++## Integration Hub Architecture
++
++The backend is not a CRUD-only service. It acts as an API Gateway and Integration Hub. UI actions call backend APIs only. The backend loads integration configuration from PostgreSQL, decrypts secrets in the service layer, resolves the correct adapter through the adapter registry, executes the external operation, writes integration logs, and invalidates cached dashboard state.
++
++```mermaid
++flowchart LR
++  UI[Next.js Settings Page] --> API[Gin API]
++  API --> Service[Integration Service]
++  Service --> Repo[Repository]
++  Repo --> DB[(PostgreSQL)]
++  Service --> Crypto[AES-GCM SecretBox]
++  Service --> Registry[Adapter Registry]
++  Registry --> Sim[Demo Simulator Adapter]
++  Registry --> HTTP[Lab/Production HTTP Adapter]
++  HTTP --> Tool[Prometheus/Grafana/Harbor/ArgoCD/etc]
++  Service --> Logs[Integration Logs + Audit Logs]
++  Service --> Redis[(Redis Overview Cache)]
++```
++
++Secrets never leave the API response boundary. `access_token_encrypted` and `password_encrypted` are persisted encrypted with AES-GCM using `INTEGRATION_ENCRYPTION_KEY`.

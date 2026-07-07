@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinelops-web
+  namespace: sentinelops
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sentinelops-web
+  template:
+    metadata:
+      labels:
+        app: sentinelops-web
+    spec:
+      containers:
+        - name: web
+          image: sentinelops/web:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: sentinelops-config
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinelops-web
+  namespace: sentinelops
+spec:
+  type: NodePort
+  ports:
+    - port: 3000
+      targetPort: 3000
+      nodePort: 30080
+  selector:
+    app: sentinelops-web

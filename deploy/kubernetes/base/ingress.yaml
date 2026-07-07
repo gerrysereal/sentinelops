@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sentinelops
+  namespace: sentinelops
+  annotations:
+    kubernetes.io/ingress.class: traefik
+spec:
+  rules:
+    - host: sentinelops.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: sentinelops-web
+                port:
+                  number: 3000
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: sentinelops-api
+                port:
+                  number: 8080

@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinelops-api
+  namespace: sentinelops
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sentinelops-api
+  template:
+    metadata:
+      labels:
+        app: sentinelops-api
+    spec:
+      containers:
+        - name: api
+          image: sentinelops/api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: sentinelops-config
+            - secretRef:
+                name: sentinelops-secret
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinelops-api
+  namespace: sentinelops
+spec:
+  ports:
+    - port: 8080
+      targetPort: 8080
+  selector:
+    app: sentinelops-api
