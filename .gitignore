@@ -1,9 +1,46 @@
+# Environment
 .env
-node_modules
-.next
-dist
-coverage
-.DS_Store
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+vendor/
+
+# Build
+.next/
+dist/
+coverage/
+
+# Logs
 *.log
-bin
-vendor
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+postgres_data/
+redis_data/
+
+# Secrets
+*.pem
+*.key
+*.crt
+*.p12
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+
+# Ansible
+*.retry
+
+# Misc
+bin/
