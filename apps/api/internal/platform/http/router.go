@@ -24,7 +24,7 @@ type Handler struct {
 	redis        *redis.Client
 }
 
-func NewRouter(cfg config.Config, overview *application.OverviewService, modules *application.ModuleService, integrations *application.IntegrationService, authMiddleware *auth.Middleware, redisClient *redis.Client, logger *slog.Logger) *gin.Engine {
+func NewRouter(cfg config.Config, overview *application.OverviewService, modules *application.ModuleService, integrations *application.IntegrationService, authMiddleware *auth.Middleware, redisClient *redis.Client, logger *slog.Logger, observabilityMiddleware gin.HandlerFunc) *gin.Engine {
 	if cfg.AppEnv == config.EnvProduction {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -32,6 +32,9 @@ func NewRouter(cfg config.Config, overview *application.OverviewService, modules
 	router := gin.New()
 	router.Use(gin.Recovery())
 	router.Use(requestID())
+	if observabilityMiddleware != nil {
+		router.Use(observabilityMiddleware)
+	}
 	router.Use(requestTimeout(cfg.RequestTimeout))
 	router.Use(requestLogger(logger))
 	if len(cfg.AllowedOrigins) > 0 {

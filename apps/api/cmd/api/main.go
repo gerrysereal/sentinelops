@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/sentinelops/sentinelops/apps/api/internal/application"
 	"github.com/sentinelops/sentinelops/apps/api/internal/config"
+	"github.com/sentinelops/sentinelops/apps/api/internal/observability"
 	"github.com/sentinelops/sentinelops/apps/api/internal/platform/auth"
 	"github.com/sentinelops/sentinelops/apps/api/internal/platform/cache"
 	secretcrypto "github.com/sentinelops/sentinelops/apps/api/internal/platform/crypto"
@@ -21,33 +23,56 @@ import (
 	"github.com/sentinelops/sentinelops/apps/api/internal/platform/logging"
 )
 
+const (
+	startupTimeout  = 30 * time.Second
+	shutdownTimeout = 15 * time.Second
+)
+
 func main() {
+	if err := run(); err != nil {
+		slog.Error("SentinelOps API terminated", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	cfg := config.Load()
 	logger := logging.New(cfg.LogFormat, os.Stdout)
 	slog.SetDefault(logger)
 	if err := cfg.Validate(); err != nil {
-		logger.Error("invalid runtime configuration", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("invalid runtime configuration: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	startupCtx, startupCancel := context.WithTimeout(context.Background(), startupTimeout)
+	defer startupCancel()
 
-	pool, err := database.Connect(ctx, cfg.DatabaseURL)
+	telemetryConfig := observability.LoadConfigFromEnv()
+	telemetry, err := observability.New(startupCtx, telemetryConfig)
 	if err != nil {
-		logger.Error("connect postgres failed", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("initialize observability: %w", err)
+	}
+	defer shutdownTelemetry(logger, telemetry)
+
+	logger.Info("observability initialized",
+		"enabled", telemetryConfig.Enabled,
+		"service_name", telemetryConfig.ServiceName,
+		"service_version", telemetryConfig.ServiceVersion,
+		"deployment_environment", telemetryConfig.DeploymentEnvironment,
+		"otlp_endpoint", telemetryConfig.OTLPEndpoint,
+	)
+
+	pool, err := database.Connect(startupCtx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("connect postgres: %w", err)
 	}
 	defer pool.Close()
 
-	if err := database.Migrate(ctx, pool); err != nil {
-		logger.Error("migrate postgres failed", "error", err)
-		os.Exit(1)
+	if err := database.Migrate(startupCtx, pool); err != nil {
+		return fmt.Errorf("migrate postgres: %w", err)
 	}
 
-	if err := database.Seed(ctx, pool, cfg.PlatformMode); err != nil {
-		logger.Error("seed postgres failed", "error", err)
-		os.Exit(1)
+	if err := database.Seed(startupCtx, pool, cfg.PlatformMode); err != nil {
+		return fmt.Errorf("seed postgres: %w", err)
 	}
 
 	redisClient := cache.NewRedisClient(cfg.RedisAddr, cfg.RedisPassword)
@@ -59,8 +84,7 @@ func main() {
 
 	secretBox, err := secretcrypto.NewSecretBox(cfg.EncryptionKey)
 	if err != nil {
-		logger.Error("initialize secret box failed", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("initialize secret box: %w", err)
 	}
 	integrationRegistry := integrations.NewRegistry(integrations.RegistryOptions{
 		Mode:    cfg.PlatformMode,
@@ -70,7 +94,16 @@ func main() {
 	integrationService := application.NewIntegrationService(repository, secretBox, integrationRegistry, cfg.PlatformMode)
 
 	authMiddleware := auth.NewMiddleware(cfg)
-	router := httpplatform.NewRouter(cfg, overviewService, moduleService, integrationService, authMiddleware, redisClient, logger)
+	router := httpplatform.NewRouter(
+		cfg,
+		overviewService,
+		moduleService,
+		integrationService,
+		authMiddleware,
+		redisClient,
+		logger,
+		telemetry.HTTPMiddleware(),
+	)
 
 	server := &http.Server{
 		Addr:              ":" + cfg.APIPort,
@@ -81,23 +114,49 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
+	serverErrors := make(chan error, 1)
 	go func() {
 		logger.Info("SentinelOps API listening", "port", cfg.APIPort, "app_env", cfg.AppEnv, "platform_mode", cfg.PlatformMode)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("api server failed", "error", err)
-			os.Exit(1)
+			serverErrors <- err
 		}
+		close(serverErrors)
 	}()
 
-	shutdown := make(chan os.Signal, 1)
-	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
-	<-shutdown
+	shutdownSignals := make(chan os.Signal, 1)
+	signal.Notify(shutdownSignals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(shutdownSignals)
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer shutdownCancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		logger.Error("api graceful shutdown failed", "error", err)
-		os.Exit(1)
+	select {
+	case signalValue := <-shutdownSignals:
+		logger.Info("shutdown signal received", "signal", signalValue.String())
+	case err := <-serverErrors:
+		if err != nil {
+			return fmt.Errorf("api server failed: %w", err)
+		}
 	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer shutdownCancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("api graceful shutdown: %w", err)
+	}
+	if err := telemetry.ForceFlush(shutdownCtx); err != nil {
+		logger.Warn("observability force flush completed with errors", "error", err)
+	}
+	if err := telemetry.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("shutdown observability: %w", err)
+	}
+
 	logger.Info("SentinelOps API stopped")
+	return nil
+}
+
+func shutdownTelemetry(logger *slog.Logger, telemetry *observability.SDK) {
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := telemetry.Shutdown(ctx); err != nil {
+		logger.Error("observability shutdown failed", "error", err)
+	}
 }
