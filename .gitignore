@@ -44,3 +44,20 @@ redis_data/
 
 # Misc
 bin/
+
+# Temporary patches
+*.patch
+*.rej
+
+# Backup files
+*.bak
+*.orig
+*.before-*
+.repair-backup/
+
+# Local project backups
+apps.bak/
+apps.before-*/
+
+# Local repair scripts
+sentinelops-*-repair.sh

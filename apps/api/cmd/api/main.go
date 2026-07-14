@@ -61,11 +61,14 @@ func run() error {
 		"otlp_endpoint", telemetryConfig.OTLPEndpoint,
 	)
 
-	pool, err := database.Connect(startupCtx, cfg.DatabaseURL)
+	pool, err := database.Connect(startupCtx, cfg.DatabaseURL, telemetry.PostgresTracer())
 	if err != nil {
 		return fmt.Errorf("connect postgres: %w", err)
 	}
 	defer pool.Close()
+	if err := telemetry.RecordPostgresStats(pool); err != nil {
+		return fmt.Errorf("initialize postgres observability: %w", err)
+	}
 
 	if err := database.Migrate(startupCtx, pool); err != nil {
 		return fmt.Errorf("migrate postgres: %w", err)
