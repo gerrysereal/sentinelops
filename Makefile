@@ -1,4 +1,4 @@
-.PHONY: up down logs api web test fmt
+.PHONY: up down logs api web test fmt validate-observability
 
 up:
 	docker compose up --build
@@ -21,3 +21,6 @@ test:
 
 fmt:
 	cd apps/api && gofmt -w .
+
+validate-observability:
+	./scripts/validate-observability.sh
