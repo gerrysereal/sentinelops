@@ -79,6 +79,9 @@ func run() error {
 	}
 
 	redisClient := cache.NewRedisClient(cfg.RedisAddr, cfg.RedisPassword)
+	if err := telemetry.InstrumentRedis(redisClient); err != nil {
+		return fmt.Errorf("initialize redis observability: %w", err)
+	}
 	defer redisClient.Close()
 
 	repository := database.NewRepository(pool)
