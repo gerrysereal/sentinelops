@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"os"
 	"time"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 type ctxKey string
@@ -50,13 +52,38 @@ func Actor(ctx context.Context) string {
 	return "system"
 }
 
+func TraceID(ctx context.Context) string {
+	spanContext := trace.SpanContextFromContext(ctx)
+	if !spanContext.IsValid() {
+		return ""
+	}
+	return spanContext.TraceID().String()
+}
+
+func SpanID(ctx context.Context) string {
+	spanContext := trace.SpanContextFromContext(ctx)
+	if !spanContext.IsValid() {
+		return ""
+	}
+	return spanContext.SpanID().String()
+}
+
+// Attrs returns the standard correlation attributes for context-aware logs.
+// Trace and span identifiers are added only when a valid OpenTelemetry span is
+// present, so local no-op telemetry remains clean.
 func Attrs(ctx context.Context) []slog.Attr {
-	attrs := []slog.Attr{}
+	attrs := make([]slog.Attr, 0, 4)
 	if requestID := RequestID(ctx); requestID != "" {
 		attrs = append(attrs, slog.String("request_id", requestID))
 	}
 	if actor := Actor(ctx); actor != "" {
 		attrs = append(attrs, slog.String("actor", actor))
+	}
+	if traceID := TraceID(ctx); traceID != "" {
+		attrs = append(attrs, slog.String("trace_id", traceID))
+	}
+	if spanID := SpanID(ctx); spanID != "" {
+		attrs = append(attrs, slog.String("span_id", spanID))
 	}
 	return attrs
 }

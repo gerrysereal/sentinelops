@@ -1,13 +1,13 @@
 package auth
 
 import (
-	"context"
 	"crypto/subtle"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/sentinelops/sentinelops/apps/api/internal/config"
+	platformlogging "github.com/sentinelops/sentinelops/apps/api/internal/platform/logging"
 )
 
 type Middleware struct {
@@ -34,7 +34,7 @@ func (m *Middleware) RequireAuth() gin.HandlerFunc {
 		c.Set("principal", principal.Name)
 		c.Set("role", principal.Role)
 		c.Set("permissions", principal.Permissions)
-		ctx := context.WithValue(c.Request.Context(), "actor", principal.Name)
+		ctx := platformlogging.WithActor(c.Request.Context(), principal.Name)
 		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	}
