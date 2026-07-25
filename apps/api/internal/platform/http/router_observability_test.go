@@ -34,6 +34,7 @@ func TestNewRouterAppliesObservabilityMiddleware(t *testing.T) {
 		nil,
 		auth.NewMiddleware(cfg),
 		nil,
+nil,
 		logger,
 		observabilityMiddleware,
 	)

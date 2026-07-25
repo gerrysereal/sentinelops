@@ -16,15 +16,21 @@ import (
 	"github.com/sentinelops/sentinelops/apps/api/internal/platform/auth"
 )
 
+type postgresPinger interface {
+	Ping(context.Context) error
+}
+
 type Handler struct {
 	cfg          config.Config
 	overview     *application.OverviewService
 	modules      *application.ModuleService
 	integrations *application.IntegrationService
 	redis        *redis.Client
+	postgres     postgresPinger
+	logger       *slog.Logger
 }
 
-func NewRouter(cfg config.Config, overview *application.OverviewService, modules *application.ModuleService, integrations *application.IntegrationService, authMiddleware *auth.Middleware, redisClient *redis.Client, logger *slog.Logger, observabilityMiddleware gin.HandlerFunc) *gin.Engine {
+func NewRouter(cfg config.Config, overview *application.OverviewService, modules *application.ModuleService, integrations *application.IntegrationService, authMiddleware *auth.Middleware, redisClient *redis.Client, postgres postgresPinger, logger *slog.Logger, observabilityMiddleware gin.HandlerFunc) *gin.Engine {
 	if cfg.AppEnv == config.EnvProduction {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -47,7 +53,15 @@ func NewRouter(cfg config.Config, overview *application.OverviewService, modules
 		}))
 	}
 
-	h := &Handler{cfg: cfg, overview: overview, modules: modules, integrations: integrations, redis: redisClient}
+	h := &Handler{
+		cfg:          cfg,
+		overview:     overview,
+		modules:      modules,
+		integrations: integrations,
+		redis:        redisClient,
+		postgres:     postgres,
+		logger:       logger,
+	}
 
 	router.GET("/health", h.health)
 	router.GET("/ready", h.readiness)
@@ -103,25 +117,76 @@ func (h *Handler) liveness(c *gin.Context) {
 }
 
 func (h *Handler) readiness(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
-	defer cancel()
 	checks := gin.H{"api": "ok"}
 	ready := true
+
 	if h.redis != nil {
-		if err := h.redis.Ping(ctx).Err(); err != nil {
-			checks["redis"] = err.Error()
+		ctx, cancel := context.WithTimeout(
+			c.Request.Context(),
+			time.Second,
+		)
+		err := h.redis.Ping(ctx).Err()
+		cancel()
+
+		if err != nil {
+			checks["redis"] = "unavailable"
 			ready = false
+
+			if h.logger != nil {
+				h.logger.ErrorContext(
+					c.Request.Context(),
+					"readiness check failed",
+					"dependency",
+					"redis",
+					"error",
+					err,
+				)
+			}
 		} else {
 			checks["redis"] = "ok"
 		}
 	}
+
+	if h.postgres != nil {
+		ctx, cancel := context.WithTimeout(
+			c.Request.Context(),
+			time.Second,
+		)
+		err := h.postgres.Ping(ctx)
+		cancel()
+
+		if err != nil {
+			checks["postgres"] = "unavailable"
+			ready = false
+
+			if h.logger != nil {
+				h.logger.ErrorContext(
+					c.Request.Context(),
+					"readiness check failed",
+					"dependency",
+					"postgres",
+					"error",
+					err,
+				)
+			}
+		} else {
+			checks["postgres"] = "ok"
+		}
+	}
+
 	status := http.StatusOK
 	state := "ready"
+
 	if !ready {
 		status = http.StatusServiceUnavailable
 		state = "degraded"
 	}
-	c.JSON(status, gin.H{"status": state, "checks": checks, "checkedAt": time.Now().UTC()})
+
+	c.JSON(status, gin.H{
+		"status":    state,
+		"checks":    checks,
+		"checkedAt": time.Now().UTC(),
+	})
 }
 
 func (h *Handler) platformConfig(c *gin.Context) {
@@ -322,11 +387,22 @@ func respond(c *gin.Context, data any, err error) {
 func respondWithStatus(c *gin.Context, status int, data any, err error) {
 	if err != nil {
 		statusCode := http.StatusInternalServerError
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		publicMessage := "internal server error"
+
+		if errors.Is(err, context.Canceled) ||
+			errors.Is(err, context.DeadlineExceeded) {
 			statusCode = http.StatusGatewayTimeout
+			publicMessage = "request timed out"
 		}
-		c.JSON(statusCode, gin.H{"error": err.Error(), "requestId": c.Writer.Header().Get("X-Request-ID")})
+
+		_ = c.Error(err)
+
+		c.JSON(statusCode, gin.H{
+			"error":     publicMessage,
+			"requestId": c.Writer.Header().Get("X-Request-ID"),
+		})
 		return
 	}
+
 	c.JSON(status, data)
 }

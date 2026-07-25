@@ -40,6 +40,13 @@ func requestLogger(logger *slog.Logger) gin.HandlerFunc {
 			slog.String("client_ip", c.ClientIP()),
 		)
 
+		if requestErr := c.Errors.Last(); requestErr != nil {
+			attrs = append(
+				attrs,
+				slog.Any("error", requestErr.Err),
+			)
+		}
+
 		level := slog.LevelInfo
 		if c.Writer.Status() >= http.StatusInternalServerError {
 			level = slog.LevelError

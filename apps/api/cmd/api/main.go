@@ -107,6 +107,7 @@ func run() error {
 		integrationService,
 		authMiddleware,
 		redisClient,
+pool,
 		logger,
 		telemetry.HTTPMiddleware(),
 	)
